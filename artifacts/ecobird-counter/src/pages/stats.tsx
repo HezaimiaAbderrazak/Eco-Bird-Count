@@ -8,8 +8,8 @@ import { format, parseISO } from "date-fns";
 export default function StatsPage() {
   const { data: stats, isLoading } = useGetSpeciesStats();
 
-  const maxActivity = stats?.recentActivity.reduce((max, day) => Math.max(max, day.detections), 0) || 1;
-  const maxSpeciesCount = stats?.topSpecies.reduce((max, s) => Math.max(max, s.count), 0) || 1;
+  const maxActivity = (stats?.recentActivity ?? []).reduce((max, day) => Math.max(max, day.detections), 0) || 1;
+  const maxSpeciesCount = (stats?.topSpecies ?? []).reduce((max, s) => Math.max(max, s.count), 0) || 1;
 
   return (
     <div className="space-y-8 animate-in fade-in duration-500">
@@ -42,7 +42,7 @@ export default function StatsPage() {
                 </div>
                 <div>
                   <p className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">Total Analyses</p>
-                  <p className="text-4xl font-serif font-bold mt-1 text-primary">{stats.totalAnalyses.toLocaleString()}</p>
+                  <p className="text-4xl font-serif font-bold mt-1 text-primary">{(stats.totalAnalyses ?? 0).toLocaleString()}</p>
                 </div>
               </CardContent>
             </Card>
@@ -54,7 +54,7 @@ export default function StatsPage() {
                 </div>
                 <div>
                   <p className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">Total Detections</p>
-                  <p className="text-4xl font-serif font-bold mt-1 text-secondary-foreground">{stats.totalDetections.toLocaleString()}</p>
+                  <p className="text-4xl font-serif font-bold mt-1 text-secondary-foreground">{(stats.totalDetections ?? 0).toLocaleString()}</p>
                 </div>
               </CardContent>
             </Card>
@@ -71,7 +71,7 @@ export default function StatsPage() {
               </CardHeader>
               <CardContent>
                 <div className="space-y-6 mt-4">
-                  {stats.topSpecies.length > 0 ? stats.topSpecies.map((species, index) => {
+                  {(stats.topSpecies ?? []).length > 0 ? (stats.topSpecies ?? []).map((species, index) => {
                     const color = getSpeciesColor(species.species);
                     const percentage = Math.max(2, (species.count / maxSpeciesCount) * 100);
                     return (
@@ -107,7 +107,7 @@ export default function StatsPage() {
                 <CardDescription>Detections over the last 7 days.</CardDescription>
               </CardHeader>
               <CardContent className="h-[300px] flex items-end justify-between gap-2 pt-8 pb-2">
-                {stats.recentActivity.length > 0 ? stats.recentActivity.map((day) => {
+                {(stats.recentActivity ?? []).length > 0 ? (stats.recentActivity ?? []).map((day) => {
                   const heightPercentage = Math.max(5, (day.detections / maxActivity) * 100);
                   return (
                     <div key={day.date} className="flex flex-col items-center flex-1 group">

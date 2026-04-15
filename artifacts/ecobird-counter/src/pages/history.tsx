@@ -45,7 +45,7 @@ export default function HistoryPage() {
                   <TableCell className="text-right"><Skeleton className="h-5 w-16 ml-auto" /></TableCell>
                 </TableRow>
               ))
-            ) : jobs && jobs.length > 0 ? (
+            ) : Array.isArray(jobs) && jobs.length > 0 ? (
               jobs.map((job) => (
                 <TableRow key={job.id}>
                   <TableCell className="font-medium flex items-center gap-3">
