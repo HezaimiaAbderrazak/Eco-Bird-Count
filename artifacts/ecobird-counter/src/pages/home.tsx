@@ -547,13 +547,13 @@ export default function Home() {
                 <CardDescription>Click a row to view the AI field guide entry.</CardDescription>
               </CardHeader>
               <Table>
-                <TableHead>
+                <TableHeader>
                   <TableRow>
                     <TableHead>Species</TableHead>
                     <TableHead className="text-right">Count</TableHead>
                     <TableHead className="text-right">Avg Confidence</TableHead>
                   </TableRow>
-                </TableHead>
+                </TableHeader>
                 <TableBody>
                   {(analysisStatus?.detections ?? []).length === 0 && (
                     <TableRow>
