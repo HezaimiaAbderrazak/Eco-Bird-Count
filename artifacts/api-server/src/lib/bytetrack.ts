@@ -16,6 +16,7 @@ export interface RawDetection {
   species: string;
   bbox: [number, number, number, number]; // [x, y, w, h] normalised 0–1
   confidence: number;
+  count?: number; // estimated flock/group size (1 for individuals)
 }
 
 export interface TrackedDetection extends RawDetection {

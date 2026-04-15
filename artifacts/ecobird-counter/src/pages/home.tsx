@@ -31,6 +31,74 @@ interface BirdDetection {
   confidence: number;
   bbox: number[];
   color: string;
+  count?: number;
+}
+
+interface TimeSegment {
+  startSec: number;
+  endSec: number;
+  minCount: number;
+  maxCount: number;
+}
+
+function computeTimeSegments(
+  frames: DetectionFrame[],
+  species: string,
+  videoDuration: number,
+): TimeSegment[] {
+  if (!frames.length) return [];
+
+  // Pick segment size: ~2s for short videos, ~5s for long ones
+  const segSec = videoDuration <= 30 ? 2 : videoDuration <= 60 ? 5 : 10;
+  const numSegs = Math.ceil(videoDuration / segSec);
+
+  const segments: TimeSegment[] = [];
+
+  for (let i = 0; i < numSegs; i++) {
+    const start = i * segSec;
+    const end = Math.min((i + 1) * segSec, videoDuration);
+
+    // Frames that fall in this segment
+    const segFrames = frames.filter(
+      f => f.timestamp >= start && f.timestamp < end,
+    );
+    if (!segFrames.length) continue;
+
+    // Per frame, sum counts for this species
+    const visibleCounts = segFrames
+      .map(f =>
+        f.detections
+          .filter(d => d.species === species)
+          .reduce((s, d) => s + (d.count ?? 1), 0),
+      )
+      .filter(n => n > 0);
+
+    if (!visibleCounts.length) continue;
+
+    segments.push({
+      startSec: start,
+      endSec: end,
+      minCount: Math.min(...visibleCounts),
+      maxCount: Math.max(...visibleCounts),
+    });
+  }
+
+  return segments;
+}
+
+function formatSegments(segments: TimeSegment[]): string {
+  if (!segments.length) return "—";
+  return segments
+    .map(s => {
+      const time = `${Math.round(s.startSec)}s–${Math.round(s.endSec)}s`;
+      if (s.minCount === s.maxCount) {
+        const n = s.maxCount;
+        const label = n >= 1000 ? `${n.toLocaleString()}+` : n > 10 ? `~${n}` : `${n}`;
+        return `${time}: ${label}`;
+      }
+      return `${time}: ${s.minCount}–${s.maxCount}`;
+    })
+    .join(" · ");
 }
 
 interface DetectionFrame {
@@ -45,10 +113,12 @@ function VideoPreview({
   file,
   autoPlay,
   onReady,
+  onDurationChange,
 }: {
   file: File;
   autoPlay: boolean;
   onReady?: (el: HTMLVideoElement) => void;
+  onDurationChange?: (d: number) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -95,7 +165,7 @@ function VideoPreview({
           onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
           onLoadedMetadata={() => {
             const v = videoRef.current;
-            if (v) { setDuration(v.duration); onReady?.(v); }
+            if (v) { setDuration(v.duration); onReady?.(v); onDurationChange?.(v.duration); }
           }}
           onEnded={() => setIsPlaying(false)}
           playsInline
@@ -134,11 +204,13 @@ function VideoPlayer({
   frames,
   onSpeciesClick,
   selectedSpecies,
+  onDurationChange,
 }: {
   file: File;
   frames: DetectionFrame[];
   onSpeciesClick: (species: string) => void;
   selectedSpecies: string | null;
+  onDurationChange?: (d: number) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -286,7 +358,7 @@ function VideoPlayer({
           src={objectUrl.current}
           className="w-full h-full object-contain"
           onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
-          onLoadedMetadata={() => { if (videoRef.current) setDuration(videoRef.current.duration); }}
+          onLoadedMetadata={() => { if (videoRef.current) { setDuration(videoRef.current.duration); onDurationChange?.(videoRef.current.duration); } }}
           onEnded={() => setIsPlaying(false)}
           playsInline
         />
@@ -385,6 +457,7 @@ export default function Home() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [selectedSpecies, setSelectedSpecies] = useState<string | null>(null);
   const [autoPlay, setAutoPlay] = useState(false);
+  const [videoDuration, setVideoDuration] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const uploadMutation = useUploadVideo();
@@ -456,6 +529,7 @@ export default function Home() {
     setJobId(null);
     setSelectedSpecies(null);
     setAutoPlay(false);
+    setVideoDuration(0);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
@@ -756,7 +830,7 @@ export default function Home() {
                 </div>
               </CardHeader>
               <CardContent>
-                <VideoPreview file={file} autoPlay={false} />
+                <VideoPreview file={file} autoPlay={false} onDurationChange={setVideoDuration} />
               </CardContent>
             </Card>
           )}
@@ -778,7 +852,7 @@ export default function Home() {
                 </div>
               </CardHeader>
               <CardContent>
-                <VideoPreview file={file} autoPlay={autoPlay} />
+                <VideoPreview file={file} autoPlay={autoPlay} onDurationChange={setVideoDuration} />
               </CardContent>
             </Card>
           )}
@@ -806,6 +880,7 @@ export default function Home() {
                   frames={frames}
                   onSpeciesClick={setSelectedSpecies}
                   selectedSpecies={selectedSpecies}
+                  onDurationChange={setVideoDuration}
                 />
               </CardContent>
             </Card>
@@ -827,8 +902,8 @@ export default function Home() {
                 <TableHeader>
                   <TableRow>
                     <TableHead>Species</TableHead>
-                    <TableHead className="text-center">Unique Birds</TableHead>
-                    <TableHead className="text-right">Avg Confidence</TableHead>
+                    <TableHead>Count by Time Segment</TableHead>
+                    <TableHead className="text-right">Confidence</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -840,41 +915,75 @@ export default function Home() {
                       </TableCell>
                     </TableRow>
                   ) : (
-                    (analysisStatus?.detections ?? []).map((d) => (
-                      <TableRow
-                        key={d.species}
-                        className={cn(
-                          "cursor-pointer hover:bg-muted/50 transition-colors",
-                          selectedSpecies === d.species && "bg-primary/5",
-                        )}
-                        onClick={() => setSelectedSpecies(d.species)}
-                      >
-                        <TableCell>
-                          <div className="flex items-center gap-2.5">
-                            <div
-                              className="w-3 h-3 rounded-full shrink-0"
-                              style={{
-                                backgroundColor: d.color || getSpeciesColor(d.species),
-                              }}
-                            />
-                            <span className="font-medium">{d.species}</span>
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-center">
-                          <Badge variant="secondary" className="font-mono tabular-nums">
-                            {d.totalCount}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="text-right">
-                          <div className="flex items-center justify-end gap-2">
-                            <span className="text-sm text-muted-foreground tabular-nums">
-                              {Math.round(d.averageConfidence * 100)}%
-                            </span>
-                            <Progress value={d.averageConfidence * 100} className="w-16 h-1.5" />
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))
+                    (analysisStatus?.detections ?? []).map((d) => {
+                      const segments = videoDuration > 0
+                        ? computeTimeSegments(frames, d.species, videoDuration)
+                        : [];
+                      const peakCount = segments.length
+                        ? Math.max(...segments.map(s => s.maxCount))
+                        : d.totalCount;
+
+                      return (
+                        <TableRow
+                          key={d.species}
+                          className={cn(
+                            "cursor-pointer hover:bg-muted/50 transition-colors",
+                            selectedSpecies === d.species && "bg-primary/5",
+                          )}
+                          onClick={() => setSelectedSpecies(d.species)}
+                        >
+                          <TableCell>
+                            <div className="flex items-center gap-2.5">
+                              <div
+                                className="w-3 h-3 rounded-full shrink-0"
+                                style={{ backgroundColor: d.color || getSpeciesColor(d.species) }}
+                              />
+                              <div>
+                                <span className="font-medium">{d.species}</span>
+                                <div className="text-xs text-muted-foreground mt-0.5">
+                                  Peak:{" "}
+                                  <span className="font-mono font-bold">
+                                    {peakCount >= 1000 ? `${peakCount.toLocaleString()}+` : peakCount > 10 ? `~${peakCount}` : peakCount}
+                                  </span>{" "}
+                                  visible
+                                </div>
+                              </div>
+                            </div>
+                          </TableCell>
+                          <TableCell>
+                            {segments.length > 0 ? (
+                              <div className="flex flex-wrap gap-1">
+                                {segments.map((s, i) => (
+                                  <span
+                                    key={i}
+                                    className="inline-flex items-center gap-1 text-xs bg-muted/60 border border-border/60 rounded px-1.5 py-0.5 font-mono"
+                                  >
+                                    <span className="text-muted-foreground">
+                                      {Math.round(s.startSec)}s–{Math.round(s.endSec)}s:
+                                    </span>
+                                    <span className="font-semibold">
+                                      {s.minCount === s.maxCount
+                                        ? (s.maxCount >= 1000 ? `${s.maxCount.toLocaleString()}+` : s.maxCount > 10 ? `~${s.maxCount}` : `${s.maxCount}`)
+                                        : `${s.minCount}–${s.maxCount}`}
+                                    </span>
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <Badge variant="secondary" className="font-mono">{d.totalCount}</Badge>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              <span className="text-sm text-muted-foreground tabular-nums">
+                                {Math.round(d.averageConfidence * 100)}%
+                              </span>
+                              <Progress value={d.averageConfidence * 100} className="w-16 h-1.5" />
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })
                   )}
                 </TableBody>
               </Table>

@@ -224,25 +224,36 @@ Analyse the provided video frame and detect ALL birds with precision.
 
 STRICT RULES:
 - Only detect birds you can actually see. Do NOT hallucinate.
-- Bounding boxes must tightly enclose the bird (not surroundings).
-- For partially occluded birds (behind branches/foliage), still report if >30% visible.
-- Use specific common English names (e.g. "Common Hoopoe" not "Hoopoe").
-- Algeria/North Africa context: priority species include Hoopoe, Bee-eater, Wheatear, Roller, Lark, White Stork, Flamingo, Northern Bald Ibis, Barn Swallow, Peregrine Falcon.
+- Use specific common English names (e.g. "Greater Flamingo" not "Flamingo", "Common Hoopoe" not "Hoopoe").
+- Algeria/North Africa context: priority species include Greater Flamingo, Hoopoe, Bee-eater, Wheatear, Roller, Lark, White Stork, Northern Bald Ibis, Barn Swallow, Peregrine Falcon, Great White Pelican, Whooper Swan.
 - confidence: your genuine certainty 0.0–1.0 (be honest — use <0.6 for uncertain cases).
 - If no birds are visible, return an empty array [].
+
+FLOCK HANDLING (CRITICAL for large groups like flamingos):
+- For LARGE FLOCKS (more than ~10 birds of the same species visible):
+  * Report ONE entry for the entire flock/group.
+  * Set "bbox" to the bounding box enclosing the whole flock area.
+  * Set "count" to your best ESTIMATE of the total number of birds visible (e.g. 40, 150, 3000).
+  * For very large dense flocks, estimate carefully: look at density × visible area.
+- For INDIVIDUAL birds or small groups (≤10):
+  * Report ONE entry PER bird (or small subgroup).
+  * Set "count" to 1 (or the small subgroup number).
+  * Bounding box should tightly enclose that individual/subgroup.
 
 Return ONLY a valid JSON array. No markdown, no explanation.
 Schema per detection:
 {
   "species": string,
   "bbox": [x, y, width, height],   // normalised 0.0–1.0, origin = top-left
-  "confidence": number              // 0.0–1.0
+  "confidence": number,             // 0.0–1.0
+  "count": number                   // 1 for individual, or estimated flock size
 }
 
-Example:
+Examples:
 [
-  {"species": "Common Hoopoe", "bbox": [0.23, 0.41, 0.14, 0.18], "confidence": 0.93},
-  {"species": "Barn Swallow",  "bbox": [0.67, 0.15, 0.08, 0.06], "confidence": 0.81}
+  {"species": "Greater Flamingo", "bbox": [0.05, 0.30, 0.90, 0.60], "confidence": 0.95, "count": 350},
+  {"species": "Common Hoopoe",    "bbox": [0.23, 0.41, 0.14, 0.18], "confidence": 0.93, "count": 1},
+  {"species": "Barn Swallow",     "bbox": [0.67, 0.15, 0.08, 0.06], "confidence": 0.81, "count": 1}
 ]`;
 
 async function detectBirdsInFrame(
@@ -275,6 +286,7 @@ async function detectBirdsInFrame(
           v => Math.min(1, Math.max(0, parseFloat(String(v)) || 0)),
         ) as [number, number, number, number],
         confidence: Math.min(1, Math.max(0, parseFloat(String(d.confidence)) || 0.7)),
+        count:      d.count != null ? Math.max(1, Math.round(parseFloat(String(d.count)) || 1)) : 1,
       }))
       .filter((d: RawDetection) => {
         // Discard degenerate boxes
@@ -478,6 +490,7 @@ async function runAnalysisPipeline(
           bbox:       d.bbox,
           confidence: d.confidence,
           color:      getSpeciesColor(d.species),
+          count:      d.count ?? 1,
         })),
       }));
 
@@ -485,18 +498,29 @@ async function runAnalysisPipeline(
         await db.insert(detectionFramesTable).values(frameRows);
       }
 
-      // ── Phase 6: Unique-track species aggregation ─────────────────────────
-      // Count UNIQUE track IDs per species to prevent count inflation.
+      // ── Phase 6: Species aggregation ──────────────────────────────────────
+      // For large-flock species (flamingos, pelicans etc.) we store the PEAK
+      // visible count across all frames.  For individually-tracked species we
+      // fall back to unique track IDs.
       const uniqueTracksBySpecies = tracker.getUniqueTracksBySpecies();
 
-      // Also accumulate confidence per species for averaging
+      // Compute peak visible count per species from frame data
+      const peakVisibleCount = new Map<string, number>();
       const speciesConfidence = new Map<string, { sum: number; n: number }>();
+
       for (const tracked of trackedByFrame.values()) {
+        // Sum counts per species in this frame
+        const frameSum = new Map<string, number>();
         for (const d of tracked) {
+          frameSum.set(d.species, (frameSum.get(d.species) ?? 0) + (d.count ?? 1));
+
           const acc = speciesConfidence.get(d.species) ?? { sum: 0, n: 0 };
           acc.sum += d.confidence;
           acc.n++;
           speciesConfidence.set(d.species, acc);
+        }
+        for (const [species, sum] of frameSum) {
+          peakVisibleCount.set(species, Math.max(peakVisibleCount.get(species) ?? 0, sum));
         }
       }
 
@@ -511,13 +535,16 @@ async function runAnalysisPipeline(
       }, 4);
 
       const detectionRows = speciesList.map(species => {
-        const trackCount = uniqueTracksBySpecies.get(species)?.size ?? 0;
-        const conf       = speciesConfidence.get(species);
-        const avgConf    = conf ? conf.sum / conf.n : 0.7;
+        const uniqueTracks = uniqueTracksBySpecies.get(species)?.size ?? 0;
+        const peakCount    = peakVisibleCount.get(species) ?? uniqueTracks;
+        // For large flocks, peak visible count is more meaningful than unique tracks
+        const totalCount   = peakCount > uniqueTracks * 2 ? peakCount : Math.max(uniqueTracks, peakCount);
+        const conf         = speciesConfidence.get(species);
+        const avgConf      = conf ? conf.sum / conf.n : 0.7;
         return {
           jobId,
           species,
-          totalCount:        trackCount,           // unique individuals
+          totalCount,                              // peak visible or unique individuals
           averageConfidence: Math.round(avgConf * 100) / 100,
           color:             getSpeciesColor(species),
           lastSeenAt:        new Date(),
