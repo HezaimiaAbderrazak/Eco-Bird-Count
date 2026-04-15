@@ -679,10 +679,11 @@ export default function Home() {
                 </div>
                 <div className="space-y-2 text-xs text-muted-foreground">
                   {[
-                    { done: (analysisStatus?.job?.progress ?? 0) >= 15, label: "Frame extraction" },
-                    { done: (analysisStatus?.job?.progress ?? 0) >= 80, label: "Gemini 1.5 Flash detection" },
+                    { done: (analysisStatus?.job?.progress ?? 0) >= 15, label: "Frame extraction (FFmpeg)" },
+                    { done: (analysisStatus?.job?.progress ?? 0) >= 22, label: "MegaDetector YOLO — bird localisation" },
+                    { done: (analysisStatus?.job?.progress ?? 0) >= 80, label: "Gemini 1.5 Flash — species classification" },
                     { done: (analysisStatus?.job?.progress ?? 0) >= 90, label: "ByteTracker ID assignment" },
-                    { done: (analysisStatus?.job?.progress ?? 0) >= 100, label: "Species validation" },
+                    { done: (analysisStatus?.job?.progress ?? 0) >= 100, label: "Wikipedia species validation" },
                   ].map(({ done, label }) => (
                     <div key={label} className="flex items-center gap-2">
                       <div className={cn(

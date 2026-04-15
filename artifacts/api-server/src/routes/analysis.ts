@@ -27,6 +27,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { ByteTracker, type RawDetection, type TrackedDetection } from "../lib/bytetrack";
+import { runMegaDetector, buildGuidedPrompt, type YoloBirdDetection } from "../lib/megadetector";
 
 const router = Router();
 const upload = multer({
@@ -260,11 +261,18 @@ async function detectBirdsInFrame(
   framePath: string,
   jobId: string,
   frameIndex: number,
+  yoloDetections?: YoloBirdDetection[],
 ): Promise<RawDetection[]> {
   try {
     const imageData = await readFile(framePath);
+
+    // Build guided prompt if YOLO found birds (MegaDetector stage 2)
+    const guidedContext = yoloDetections && yoloDetections.length > 0
+      ? buildGuidedPrompt(yoloDetections)
+      : "";
+
     const parts = [
-      { text: DETECTION_PROMPT },
+      { text: DETECTION_PROMPT + guidedContext },
       { inlineData: { mimeType: "image/jpeg", data: imageData.toString("base64") } },
     ];
 
@@ -444,16 +452,40 @@ async function runAnalysisPipeline(
 
       console.log(`[Job ${jobId}] ${frameCount} frames ready — starting detection...`);
 
-      // ── Phase 2: Detection (concurrent, 2 in-flight at a time) ────────────
+      // ── Phase 2a: MegaDetector stage 1 — YOLO bird localisation ──────────
+      // Runs all frames through YOLOv8n in one batch (same approach as
+      // MegaDetector's batch-inference API) to get precise bounding boxes first.
+      console.log(`[Job ${jobId}] Running MegaDetector YOLO stage 1...`);
+      const yoloResultsMap = new Map<string, YoloBirdDetection[]>();
+      try {
+        const allPaths = framePaths.map(f => f.path);
+        const yoloResults = await runMegaDetector(allPaths);
+        for (const r of yoloResults) {
+          yoloResultsMap.set(r.image, r.detections);
+        }
+        const totalYoloDetections = [...yoloResultsMap.values()].reduce((s, d) => s + d.length, 0);
+        console.log(`[Job ${jobId}] YOLO stage 1 complete — ${totalYoloDetections} bird proposals across ${frameCount} frames`);
+        await db
+          .update(analysisJobsTable)
+          .set({ progress: 22 })
+          .where(eq(analysisJobsTable.id, jobId));
+      } catch (err) {
+        console.warn(`[Job ${jobId}] YOLO stage 1 failed, falling back to Gemini-only:`, err);
+      }
+
+      // ── Phase 2b: Detection (concurrent, 2 in-flight at a time) ──────────
+      // MegaDetector stage 2 — Gemini classifies SPECIES inside YOLO proposals
       const rawDetectionsByFrame = new Map<number, RawDetection[]>();
 
       await concurrentMap(
         framePaths,
         async (frame, batchPosition) => {
+          const yoloBirds = yoloResultsMap.get(frame.path);
           const rawDetections = await detectBirdsInFrame(
             frame.path,
             jobId,
             frame.frameIndex,
+            yoloBirds,
           );
 
           // Phase 3: Open-Set Recovery per frame
