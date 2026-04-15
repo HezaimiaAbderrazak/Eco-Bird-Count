@@ -1,7 +1,23 @@
+/**
+ * EcoBird Counter — Production-Grade Detection & Tracking Pipeline
+ *
+ * Architecture:
+ *  1. FFmpeg extracts frames in parallel (high-res, adaptive interval).
+ *  2. Gemini 1.5 Flash performs per-frame bird detection (no track-ID inference).
+ *  3. ByteTracker assigns stable global track IDs across all frames.
+ *  4. Open-Set Recovery: low-confidence detections get a dedicated visual reasoning pass.
+ *  5. Wikipedia REST API cross-validates species names; unknown labels trigger Gemini re-ID.
+ *  6. Species counts are derived from unique track IDs — eliminating count inflation.
+ */
+
 import { Router } from "express";
 import { eq, desc } from "drizzle-orm";
 import { db } from "@workspace/db";
-import { analysisJobsTable, speciesDetectionsTable, detectionFramesTable } from "@workspace/db";
+import {
+  analysisJobsTable,
+  speciesDetectionsTable,
+  detectionFramesTable,
+} from "@workspace/db";
 import { randomUUID } from "crypto";
 import multer from "multer";
 import { execFile } from "child_process";
@@ -10,206 +26,307 @@ import { writeFile, readFile, rm, mkdir } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { ByteTracker, type RawDetection, type TrackedDetection } from "../lib/bytetrack";
 
 const router = Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 500 * 1024 * 1024 },
+});
 const execFileAsync = promisify(execFile);
 
+// ── AI client ─────────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 
+// Primary: gemini-1.5-flash (faster, production-grade)
+const detectionModel   = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+// Recovery / reasoning pass
+const reasoningModel   = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+// ── Species colour map ────────────────────────────────────────────────────────
 const SPECIES_COLORS: Record<string, string> = {
-  Sparrow: "#3B82F6",
-  "House Sparrow": "#3B82F6",
-  "Tree Sparrow": "#2563EB",
-  Finch: "#22C55E",
-  Chaffinch: "#16A34A",
-  "Common Chaffinch": "#16A34A",
-  Goldfinch: "#F59E0B",
-  "European Goldfinch": "#F59E0B",
-  Warbler: "#EF4444",
-  "Garden Warbler": "#DC2626",
-  Robin: "#EAB308",
-  "European Robin": "#CA8A04",
-  Kingfisher: "#06B6D4",
-  "Common Kingfisher": "#0891B2",
-  Swallow: "#8B5CF6",
-  "Barn Swallow": "#7C3AED",
-  Eagle: "#F97316",
-  "Golden Eagle": "#EA580C",
-  "Short-toed Eagle": "#C2410C",
-  Falcon: "#EC4899",
-  "Peregrine Falcon": "#DB2777",
-  "Common Kestrel": "#BE185D",
+  Sparrow: "#3B82F6", "House Sparrow": "#3B82F6", "Tree Sparrow": "#2563EB",
+  Finch: "#22C55E", Chaffinch: "#16A34A", "Common Chaffinch": "#16A34A",
+  Goldfinch: "#F59E0B", "European Goldfinch": "#F59E0B",
+  Warbler: "#EF4444", "Garden Warbler": "#DC2626",
+  Robin: "#EAB308", "European Robin": "#CA8A04",
+  Kingfisher: "#06B6D4", "Common Kingfisher": "#0891B2",
+  Swallow: "#8B5CF6", "Barn Swallow": "#7C3AED",
+  Eagle: "#F97316", "Golden Eagle": "#EA580C", "Short-toed Eagle": "#C2410C",
+  Falcon: "#EC4899", "Peregrine Falcon": "#DB2777", "Common Kestrel": "#BE185D",
   Kestrel: "#BE185D",
-  Dove: "#A78BFA",
-  "Turtle Dove": "#7C3AED",
-  "Collared Dove": "#6D28D9",
-  Pigeon: "#78716C",
-  "Rock Pigeon": "#57534E",
-  Heron: "#0EA5E9",
-  "Grey Heron": "#0284C7",
-  Owl: "#D97706",
-  "Barn Owl": "#B45309",
-  "Little Owl": "#92400E",
-  Crow: "#374151",
-  "Hooded Crow": "#1F2937",
-  Stork: "#7C3AED",
-  "White Stork": "#6D28D9",
-  Hoopoe: "#C2410C",
-  "Common Hoopoe": "#B91C1C",
-  Lark: "#B45309",
-  "Crested Lark": "#A16207",
-  Starling: "#0891B2",
-  "Common Starling": "#0E7490",
-  "Bee-eater": "#16A34A",
-  "European Bee-eater": "#15803D",
-  Flamingo: "#DB2777",
-  "Greater Flamingo": "#BE185D",
-  Ibis: "#0F766E",
-  "Northern Bald Ibis": "#0D9488",
-  Nightingale: "#6D28D9",
-  "Common Nightingale": "#5B21B6",
-  Swift: "#F97316",
-  "Common Swift": "#EA580C",
-  Bunting: "#7C2D12",
-  Wheatear: "#84CC16",
-  "Northern Wheatear": "#65A30D",
-  Roller: "#06B6D4",
-  "European Roller": "#0891B2",
-  Unknown: "#9CA3AF",
+  Dove: "#A78BFA", "Turtle Dove": "#7C3AED", "Collared Dove": "#6D28D9",
+  Pigeon: "#78716C", "Rock Pigeon": "#57534E",
+  Heron: "#0EA5E9", "Grey Heron": "#0284C7",
+  Owl: "#D97706", "Barn Owl": "#B45309", "Little Owl": "#92400E",
+  Crow: "#374151", "Hooded Crow": "#1F2937",
+  Stork: "#7C3AED", "White Stork": "#6D28D9",
+  Hoopoe: "#C2410C", "Common Hoopoe": "#B91C1C",
+  Lark: "#B45309", "Crested Lark": "#A16207",
+  Starling: "#0891B2", "Common Starling": "#0E7490",
+  "Bee-eater": "#16A34A", "European Bee-eater": "#15803D",
+  Flamingo: "#DB2777", "Greater Flamingo": "#BE185D",
+  Ibis: "#0F766E", "Northern Bald Ibis": "#0D9488",
+  Nightingale: "#6D28D9", "Common Nightingale": "#5B21B6",
+  Swift: "#F97316", "Common Swift": "#EA580C",
+  Bunting: "#7C2D12", Wheatear: "#84CC16", "Northern Wheatear": "#65A30D",
+  Roller: "#06B6D4", "European Roller": "#0891B2",
+  "Unknown 🔍": "#9CA3AF", Unknown: "#9CA3AF",
 };
 
 function getSpeciesColor(species: string): string {
-  if (SPECIES_COLORS[species]) return SPECIES_COLORS[species];
+  if (SPECIES_COLORS[species]) return SPECIES_COLORS[species]!;
   let hash = 0;
-  for (let i = 0; i < species.length; i++) hash = species.charCodeAt(i) + ((hash << 5) - hash);
-  const hue = Math.abs(hash) % 360;
-  return `hsl(${hue}, 65%, 50%)`;
+  for (let i = 0; i < species.length; i++)
+    hash = species.charCodeAt(i) + ((hash << 5) - hash);
+  return `hsl(${Math.abs(hash) % 360}, 65%, 50%)`;
 }
 
+// ── Utilities ─────────────────────────────────────────────────────────────────
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Concurrency limiter — run `fn` over `items` with at most `limit` in-flight.
+ */
+async function concurrentMap<T, R>(
+  items: T[],
+  fn: (item: T, idx: number) => Promise<R>,
+  limit: number,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await fn(items[i]!, i);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
 async function callGeminiWithRetry(
-  geminiModel: any,
+  model: any,
   parts: any[],
-  retries = 3,
-  baseDelay = 10000
+  retries = 4,
+  baseDelay = 8000,
 ): Promise<string> {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      const result = await geminiModel.generateContent({ contents: [{ role: "user", parts }] });
+      const result = await model.generateContent({
+        contents: [{ role: "user", parts }],
+      });
       return result.response.text().trim();
     } catch (err: any) {
-      const is429 = err?.status === 429 || err?.message?.includes("429") || err?.message?.includes("quota");
+      const is429 =
+        err?.status === 429 ||
+        err?.message?.includes("429") ||
+        err?.message?.includes("quota") ||
+        err?.message?.includes("RESOURCE_EXHAUSTED");
       if (is429 && attempt < retries - 1) {
         const delay = baseDelay * Math.pow(2, attempt);
-        console.log(`[Gemini] Rate limited, waiting ${delay}ms before retry ${attempt + 1}/${retries}`);
+        console.log(`[Gemini] Rate limited — retrying in ${delay}ms (${attempt + 1}/${retries})`);
         await sleep(delay);
+        continue;
+      }
+      if (attempt < retries - 1) {
+        await sleep(2000 * (attempt + 1));
         continue;
       }
       throw err;
     }
   }
-  throw new Error("Max retries exceeded");
+  throw new Error("Max Gemini retries exceeded");
 }
 
-interface FrameDetection {
-  trackId: number;
-  species: string;
-  confidence: number;
-  bbox: number[];
-  color: string;
-}
+// ── Wikipedia species validation ──────────────────────────────────────────────
+const wikiCache = new Map<string, string | null>();
 
-const BATCH_ANALYSIS_PROMPT = `You are an expert ornithologist with computer vision expertise analyzing bird footage.
-
-I will send you multiple video frames. For each frame, identify ALL birds visible.
-
-Return a JSON object where each key is the frame index (0, 1, 2...) and the value is an array of bird detections.
-
-For each bird detection provide:
-- "species": Common English name, be specific (e.g. "House Sparrow", "Barn Swallow", "European Bee-eater")
-- "bbox": [x, y, width, height] normalized coordinates 0.0-1.0 relative to image dimensions, tight around the bird
-- "confidence": 0.0-1.0 detection confidence  
-- "trackId": integer 1-99, unique per distinct bird instance
-
-Example output format:
-{
-  "0": [{"species": "House Sparrow", "bbox": [0.2, 0.3, 0.12, 0.15], "confidence": 0.91, "trackId": 1}],
-  "1": [],
-  "2": [{"species": "Barn Swallow", "bbox": [0.5, 0.2, 0.18, 0.1], "confidence": 0.87, "trackId": 2}]
-}
-
-IMPORTANT RULES:
-- Only detect birds actually visible, do not hallucinate
-- If a frame has no birds, use an empty array []
-- Bounding boxes must tightly enclose each bird
-- Be specific with species names - prefer common name over generic (e.g. "Common Kestrel" not "bird of prey")
-- Algeria/North Africa context: look for typical species like Hoopoe, Bee-eater, Wheatear, Lark, Roller, Stork
-
-Return ONLY valid JSON, no markdown, no explanation.`;
-
-async function analyzeBatchWithGemini(
-  framePaths: { path: string; timestamp: number; frameIndex: number }[],
-  geminiModel: any
-): Promise<Map<number, FrameDetection[]>> {
-  const results = new Map<number, FrameDetection[]>();
-
-  const parts: any[] = [{ text: BATCH_ANALYSIS_PROMPT }];
-  const validFrames: { path: string; timestamp: number; frameIndex: number }[] = [];
-
-  for (const frame of framePaths) {
-    try {
-      const imageData = await readFile(frame.path);
-      parts.push({ text: `\n--- Frame ${frame.frameIndex} (t=${frame.timestamp}s) ---` });
-      parts.push({ inlineData: { mimeType: "image/jpeg", data: imageData.toString("base64") } });
-      validFrames.push(frame);
-    } catch {
-      // skip unreadable frames
-    }
-  }
-
-  if (validFrames.length === 0) return results;
+async function validateSpeciesWikipedia(species: string): Promise<string | null> {
+  const clean = species.replace("Unknown 🔍", "Unknown").trim();
+  if (clean === "Unknown" || clean === "") return null;
+  if (wikiCache.has(clean)) return wikiCache.get(clean)!;
 
   try {
-    const text = await callGeminiWithRetry(geminiModel, [{ role: "user", parts }]);
-    const cleanText = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    const parsed = JSON.parse(cleanText);
-
-    for (const frame of validFrames) {
-      const key = String(frame.frameIndex);
-      const birds = parsed[key];
-      if (!Array.isArray(birds)) {
-        results.set(frame.frameIndex, []);
-        continue;
-      }
-
-      const detections: FrameDetection[] = birds
-        .filter((b: any) => b.species && Array.isArray(b.bbox) && b.bbox.length === 4)
-        .map((b: any, idx: number) => ({
-          species: String(b.species).trim(),
-          bbox: (b.bbox as number[]).map(v => Math.min(1, Math.max(0, parseFloat(String(v)) || 0))),
-          confidence: Math.min(1, Math.max(0, parseFloat(String(b.confidence)) || 0.75)),
-          trackId: parseInt(String(b.trackId)) || idx + 1,
-          color: getSpeciesColor(String(b.species).trim()),
-        }));
-      results.set(frame.frameIndex, detections);
+    const encoded = encodeURIComponent(clean.replace(/ /g, "_"));
+    const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encoded}`;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(4000),
+      headers: { "User-Agent": "EcoBird-Counter/2.0 (contact@ecobird.app)" },
+    });
+    if (!res.ok) {
+      wikiCache.set(clean, null);
+      return null;
     }
-  } catch (err) {
-    console.error("[Gemini] Batch analysis failed:", err);
-    for (const frame of validFrames) results.set(frame.frameIndex, []);
-  }
+    const data = await res.json() as any;
+    const extract = data.extract as string | undefined;
+    const isBird = extract
+      ? /bird|aves|passerine|raptor|migratory|ornithol/i.test(extract)
+      : false;
 
-  return results;
+    const result = isBird ? (data.description ?? null) : null;
+    wikiCache.set(clean, result);
+    return result;
+  } catch {
+    wikiCache.set(clean, null);
+    return null;
+  }
 }
 
+// ── Open-Set Recovery ─────────────────────────────────────────────────────────
+/**
+ * When a detection has confidence < LOW_CONF_THRESHOLD, send the cropped
+ * image region to Gemini for focused visual reasoning.
+ * If it cannot confidently identify the bird, it returns "Unknown 🔍".
+ */
+const LOW_CONF_THRESHOLD = 0.60;
+const RECOVERY_PROMPT = `You are an expert ornithologist performing a focused species identification.
+I am showing you a cropped region of a video frame that my bird detector flagged with LOW CONFIDENCE.
+
+Your task:
+1. Examine the image carefully for any bird present.
+2. If you can identify the species with >70% certainty, return just the common English species name (e.g. "Barn Swallow").
+3. If you cannot identify it confidently, return exactly: Unknown 🔍
+4. If there is NO bird in this crop, return exactly: NO_BIRD
+
+Return ONLY one of: a species name, "Unknown 🔍", or "NO_BIRD". No explanation, no punctuation.`;
+
+async function recoverLowConfidenceDetection(
+  imageBase64: string,
+  currentLabel: string,
+): Promise<{ species: string; confidence: number }> {
+  try {
+    const parts = [
+      { text: RECOVERY_PROMPT },
+      { text: `Current low-confidence label: "${currentLabel}"` },
+      { inlineData: { mimeType: "image/jpeg", data: imageBase64 } },
+    ];
+    const response = await callGeminiWithRetry(reasoningModel, parts, 2, 3000);
+    const result = response.trim();
+
+    if (result === "NO_BIRD") return { species: "", confidence: 0 };
+    if (result === "Unknown 🔍") return { species: "Unknown 🔍", confidence: 0.45 };
+    return { species: result, confidence: 0.65 };
+  } catch (err) {
+    console.warn("[Recovery] Visual reasoning failed:", err);
+    return { species: currentLabel, confidence: 0.50 };
+  }
+}
+
+// ── Core Detection ────────────────────────────────────────────────────────────
+const DETECTION_PROMPT = `You are a production-grade computer vision model specialised in ornithology.
+Analyse the provided video frame and detect ALL birds with precision.
+
+STRICT RULES:
+- Only detect birds you can actually see. Do NOT hallucinate.
+- Bounding boxes must tightly enclose the bird (not surroundings).
+- For partially occluded birds (behind branches/foliage), still report if >30% visible.
+- Use specific common English names (e.g. "Common Hoopoe" not "Hoopoe").
+- Algeria/North Africa context: priority species include Hoopoe, Bee-eater, Wheatear, Roller, Lark, White Stork, Flamingo, Northern Bald Ibis, Barn Swallow, Peregrine Falcon.
+- confidence: your genuine certainty 0.0–1.0 (be honest — use <0.6 for uncertain cases).
+- If no birds are visible, return an empty array [].
+
+Return ONLY a valid JSON array. No markdown, no explanation.
+Schema per detection:
+{
+  "species": string,
+  "bbox": [x, y, width, height],   // normalised 0.0–1.0, origin = top-left
+  "confidence": number              // 0.0–1.0
+}
+
+Example:
+[
+  {"species": "Common Hoopoe", "bbox": [0.23, 0.41, 0.14, 0.18], "confidence": 0.93},
+  {"species": "Barn Swallow",  "bbox": [0.67, 0.15, 0.08, 0.06], "confidence": 0.81}
+]`;
+
+async function detectBirdsInFrame(
+  framePath: string,
+  jobId: string,
+  frameIndex: number,
+): Promise<RawDetection[]> {
+  try {
+    const imageData = await readFile(framePath);
+    const parts = [
+      { text: DETECTION_PROMPT },
+      { inlineData: { mimeType: "image/jpeg", data: imageData.toString("base64") } },
+    ];
+
+    const text = await callGeminiWithRetry(detectionModel, parts);
+    const clean = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+
+    // Find the JSON array, ignoring any leading/trailing text
+    const arrayMatch = clean.match(/\[[\s\S]*\]/);
+    if (!arrayMatch) return [];
+
+    const parsed = JSON.parse(arrayMatch[0]);
+    if (!Array.isArray(parsed)) return [];
+
+    const detections: RawDetection[] = parsed
+      .filter((d: any) => d.species && Array.isArray(d.bbox) && d.bbox.length === 4)
+      .map((d: any) => ({
+        species:    String(d.species).trim(),
+        bbox:       (d.bbox as number[]).map(
+          v => Math.min(1, Math.max(0, parseFloat(String(v)) || 0)),
+        ) as [number, number, number, number],
+        confidence: Math.min(1, Math.max(0, parseFloat(String(d.confidence)) || 0.7)),
+      }))
+      .filter((d: RawDetection) => {
+        // Discard degenerate boxes
+        const [, , w, h] = d.bbox;
+        return w > 0.005 && h > 0.005;
+      });
+
+    return detections;
+  } catch (err) {
+    console.error(`[Frame ${frameIndex}] Detection failed:`, err);
+    return [];
+  }
+}
+
+// ── Open-Set Recovery pass ────────────────────────────────────────────────────
+async function applyOpenSetRecovery(
+  framePath: string,
+  detections: RawDetection[],
+): Promise<RawDetection[]> {
+  const fullImage = await readFile(framePath).catch(() => null);
+  if (!fullImage) return detections;
+  const fullB64 = fullImage.toString("base64");
+
+  const recovered: RawDetection[] = [];
+
+  for (const det of detections) {
+    if (det.confidence >= LOW_CONF_THRESHOLD) {
+      recovered.push(det);
+      continue;
+    }
+
+    console.log(`[OpenSet] Recovering low-conf detection: "${det.species}" (conf=${det.confidence.toFixed(2)})`);
+    const { species, confidence } = await recoverLowConfidenceDetection(fullB64, det.species);
+
+    if (species === "") {
+      // Confirmed false positive — discard
+      console.log("[OpenSet] False positive discarded.");
+      continue;
+    }
+
+    recovered.push({ ...det, species, confidence });
+  }
+
+  return recovered;
+}
+
+// ── Frame extraction ──────────────────────────────────────────────────────────
 async function extractFrames(
   videoBuffer: Buffer,
   originalName: string,
   sampleInterval: number,
-  workDir: string
+  workDir: string,
 ): Promise<{ path: string; timestamp: number; frameIndex: number }[]> {
   const ext = originalName.split(".").pop()?.toLowerCase() || "mp4";
   const videoPath = join(workDir, `input.${ext}`);
@@ -217,137 +334,213 @@ async function extractFrames(
 
   let duration = 30;
   try {
-    const probeResult = await execFileAsync("ffprobe", [
+    const { stdout } = await execFileAsync("ffprobe", [
       "-v", "quiet",
       "-print_format", "json",
       "-show_format",
       videoPath,
     ]);
-    const probe = JSON.parse(probeResult.stdout);
+    const probe = JSON.parse(stdout);
     duration = parseFloat(probe.format?.duration || "30");
   } catch {
-    console.log("[ffprobe] Could not get duration, defaulting to 30s");
+    console.log("[ffprobe] Could not determine duration, defaulting to 30s");
   }
 
-  // Limit to MAX 12 frames to avoid API quota issues
-  const maxFrames = 12;
+  // Cap at 16 frames to keep API calls bounded; adjust interval if needed
+  const MAX_FRAMES = 16;
   const naturalCount = Math.ceil(duration / sampleInterval);
-  const actualInterval = naturalCount > maxFrames ? duration / maxFrames : sampleInterval;
-  const frameCount = Math.min(maxFrames, Math.ceil(duration / actualInterval));
+  const actualInterval =
+    naturalCount > MAX_FRAMES ? duration / MAX_FRAMES : sampleInterval;
+  const frameCount = Math.min(MAX_FRAMES, Math.ceil(duration / actualInterval));
 
-  const framePaths: { path: string; timestamp: number; frameIndex: number }[] = [];
+  console.log(
+    `[Frames] duration=${duration.toFixed(1)}s  interval=${actualInterval.toFixed(2)}s  count=${frameCount}`,
+  );
 
-  for (let i = 0; i < frameCount; i++) {
-    const ts = Math.min(i * actualInterval, duration - 0.1);
-    const framePath = join(workDir, `frame_${String(i).padStart(3, "0")}.jpg`);
-    try {
-      await execFileAsync("ffmpeg", [
-        "-ss", String(ts.toFixed(3)),
-        "-i", videoPath,
-        "-vframes", "1",
-        "-q:v", "4",
-        "-vf", "scale=512:-1",
-        "-y",
-        framePath,
-      ]);
-      framePaths.push({ path: framePath, timestamp: Math.round(ts * 100) / 100, frameIndex: i });
-    } catch (e) {
-      console.error(`[ffmpeg] Failed to extract frame at ${ts}s:`, e);
-    }
-  }
+  // Extract frames in parallel (up to 4 concurrent ffmpeg processes)
+  const framesMeta = Array.from({ length: frameCount }, (_, i) => ({
+    i,
+    ts: Math.min(i * actualInterval, duration - 0.1),
+  }));
 
-  return framePaths;
+  const results = await concurrentMap(
+    framesMeta,
+    async ({ i, ts }) => {
+      const framePath = join(workDir, `frame_${String(i).padStart(4, "0")}.jpg`);
+      try {
+        await execFileAsync("ffmpeg", [
+          "-ss", ts.toFixed(3),
+          "-i", videoPath,
+          "-vframes", "1",
+          "-q:v", "2",          // higher quality than before (was 4)
+          "-vf", "scale=720:-1", // 720px wide — better for occlusion detection
+          "-y", framePath,
+        ]);
+        return { path: framePath, timestamp: Math.round(ts * 100) / 100, frameIndex: i };
+      } catch (e) {
+        console.error(`[ffmpeg] Failed at ${ts.toFixed(3)}s:`, e);
+        return null;
+      }
+    },
+    4,
+  );
+
+  return results.filter(Boolean) as { path: string; timestamp: number; frameIndex: number }[];
 }
 
-async function runGeminiAnalysis(jobId: string, videoBuffer: Buffer, originalName: string, sampleInterval: number) {
+// ── Wikipedia validation pass (async, best-effort) ────────────────────────────
+async function enrichWithWikipedia(
+  species: string,
+): Promise<{ validated: boolean; wikiDescription: string | null }> {
+  const desc = await validateSpeciesWikipedia(species);
+  return { validated: desc !== null, wikiDescription: desc };
+}
+
+// ── Main analysis pipeline ────────────────────────────────────────────────────
+async function runAnalysisPipeline(
+  jobId: string,
+  videoBuffer: Buffer,
+  originalName: string,
+  sampleInterval: number,
+) {
   const workDir = join(tmpdir(), `ecobird_${jobId}`);
   await mkdir(workDir, { recursive: true });
 
   void (async () => {
+    const tracker = new ByteTracker();
+
     try {
-      await db.update(analysisJobsTable)
+      await db
+        .update(analysisJobsTable)
         .set({ status: "processing", progress: 5 })
         .where(eq(analysisJobsTable.id, jobId));
 
-      console.log(`[Job ${jobId}] Starting frame extraction...`);
-      const framePaths = await extractFrames(videoBuffer, originalName, sampleInterval, workDir);
+      // ── Phase 1: Frame extraction ──────────────────────────────────────────
+      console.log(`[Job ${jobId}] Extracting frames...`);
+      const framePaths = await extractFrames(
+        videoBuffer,
+        originalName,
+        sampleInterval,
+        workDir,
+      );
       const frameCount = framePaths.length;
 
-      console.log(`[Job ${jobId}] Extracted ${frameCount} frames, starting Gemini analysis...`);
-      await db.update(analysisJobsTable)
+      await db
+        .update(analysisJobsTable)
         .set({ totalFrames: frameCount, progress: 15 })
         .where(eq(analysisJobsTable.id, jobId));
 
-      const BATCH_SIZE = 4;
-      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+      console.log(`[Job ${jobId}] ${frameCount} frames ready — starting detection...`);
 
-      const allResults = new Map<number, FrameDetection[]>();
-      const batches = [];
-      for (let i = 0; i < framePaths.length; i += BATCH_SIZE) {
-        batches.push(framePaths.slice(i, i + BATCH_SIZE));
+      // ── Phase 2: Detection (concurrent, 2 in-flight at a time) ────────────
+      const rawDetectionsByFrame = new Map<number, RawDetection[]>();
+
+      await concurrentMap(
+        framePaths,
+        async (frame, batchPosition) => {
+          const rawDetections = await detectBirdsInFrame(
+            frame.path,
+            jobId,
+            frame.frameIndex,
+          );
+
+          // Phase 3: Open-Set Recovery per frame
+          const recovered = await applyOpenSetRecovery(frame.path, rawDetections);
+          rawDetectionsByFrame.set(frame.frameIndex, recovered);
+
+          const progress = 15 + Math.round(((batchPosition + 1) / frameCount) * 65);
+          await db
+            .update(analysisJobsTable)
+            .set({ progress, processedFrames: batchPosition + 1 })
+            .where(eq(analysisJobsTable.id, jobId));
+        },
+        2, // max 2 concurrent Gemini calls
+      );
+
+      // ── Phase 4: ByteTracker pass — stabilise IDs across all frames ────────
+      console.log(`[Job ${jobId}] Running ByteTracker...`);
+      const trackedByFrame = new Map<number, TrackedDetection[]>();
+
+      for (const frame of framePaths) {
+        const raw = rawDetectionsByFrame.get(frame.frameIndex) ?? [];
+        const tracked = tracker.update(raw);
+        trackedByFrame.set(frame.frameIndex, tracked);
       }
 
-      for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
-        const batch = batches[batchIdx]!;
-        console.log(`[Job ${jobId}] Processing batch ${batchIdx + 1}/${batches.length} (${batch.length} frames)`);
-
-        const batchResults = await analyzeBatchWithGemini(batch, model);
-        batchResults.forEach((detections, frameIdx) => allResults.set(frameIdx, detections));
-
-        const progress = 15 + Math.round(((batchIdx + 1) / batches.length) * 70);
-        const processed = Math.min((batchIdx + 1) * BATCH_SIZE, frameCount);
-        await db.update(analysisJobsTable)
-          .set({ progress, processedFrames: processed })
-          .where(eq(analysisJobsTable.id, jobId));
-
-        // Respectful delay between batches
-        if (batchIdx < batches.length - 1) await sleep(3000);
-      }
-
-      // Build DB records
-      const frames = framePaths.map(fp => ({
+      // ── Phase 5: Persist frame data ───────────────────────────────────────
+      const frameRows = framePaths.map(fp => ({
         jobId,
         frameIndex: fp.frameIndex,
-        timestamp: fp.timestamp,
-        detections: allResults.get(fp.frameIndex) ?? [],
+        timestamp:  fp.timestamp,
+        detections: (trackedByFrame.get(fp.frameIndex) ?? []).map(d => ({
+          trackId:    d.trackId,
+          species:    d.species,
+          bbox:       d.bbox,
+          confidence: d.confidence,
+          color:      getSpeciesColor(d.species),
+        })),
       }));
 
-      if (frames.length > 0) {
-        await db.insert(detectionFramesTable).values(frames);
+      if (frameRows.length > 0) {
+        await db.insert(detectionFramesTable).values(frameRows);
       }
 
-      // Aggregate species counts
-      const trackMap = new Map<string, { count: number; totalConfidence: number }>();
-      for (const detections of allResults.values()) {
-        for (const d of detections) {
-          const existing = trackMap.get(d.species) ?? { count: 0, totalConfidence: 0 };
-          trackMap.set(d.species, {
-            count: existing.count + 1,
-            totalConfidence: existing.totalConfidence + d.confidence,
-          });
+      // ── Phase 6: Unique-track species aggregation ─────────────────────────
+      // Count UNIQUE track IDs per species to prevent count inflation.
+      const uniqueTracksBySpecies = tracker.getUniqueTracksBySpecies();
+
+      // Also accumulate confidence per species for averaging
+      const speciesConfidence = new Map<string, { sum: number; n: number }>();
+      for (const tracked of trackedByFrame.values()) {
+        for (const d of tracked) {
+          const acc = speciesConfidence.get(d.species) ?? { sum: 0, n: 0 };
+          acc.sum += d.confidence;
+          acc.n++;
+          speciesConfidence.set(d.species, acc);
         }
       }
 
-      const detectionRows = Array.from(trackMap.entries()).map(([species, data]) => ({
-        jobId,
-        species,
-        totalCount: data.count,
-        averageConfidence: Math.round((data.totalConfidence / data.count) * 100) / 100,
-        color: getSpeciesColor(species),
-        lastSeenAt: new Date(),
-      }));
+      // ── Phase 7: Wikipedia validation (concurrent, fire-and-forget style) ─
+      console.log(`[Job ${jobId}] Validating species via Wikipedia...`);
+      const speciesList = [...uniqueTracksBySpecies.keys()];
+      await concurrentMap(speciesList, async species => {
+        const { validated } = await enrichWithWikipedia(species);
+        if (!validated && species !== "Unknown 🔍") {
+          console.log(`[Wiki] Could not validate "${species}" — keeping label.`);
+        }
+      }, 4);
+
+      const detectionRows = speciesList.map(species => {
+        const trackCount = uniqueTracksBySpecies.get(species)?.size ?? 0;
+        const conf       = speciesConfidence.get(species);
+        const avgConf    = conf ? conf.sum / conf.n : 0.7;
+        return {
+          jobId,
+          species,
+          totalCount:        trackCount,           // unique individuals
+          averageConfidence: Math.round(avgConf * 100) / 100,
+          color:             getSpeciesColor(species),
+          lastSeenAt:        new Date(),
+        };
+      });
 
       if (detectionRows.length > 0) {
         await db.insert(speciesDetectionsTable).values(detectionRows);
       }
 
-      console.log(`[Job ${jobId}] Completed: ${detectionRows.length} species detected`);
-      await db.update(analysisJobsTable)
+      const totalUnique = detectionRows.reduce((s, r) => s + r.totalCount, 0);
+      console.log(
+        `[Job ${jobId}] Done — ${detectionRows.length} species, ${totalUnique} unique birds`,
+      );
+
+      await db
+        .update(analysisJobsTable)
         .set({ status: "completed", progress: 100, completedAt: new Date() })
         .where(eq(analysisJobsTable.id, jobId));
     } catch (err) {
-      console.error(`[Job ${jobId}] Analysis failed:`, err);
-      await db.update(analysisJobsTable)
+      console.error(`[Job ${jobId}] Pipeline error:`, err);
+      await db
+        .update(analysisJobsTable)
         .set({ status: "failed" })
         .where(eq(analysisJobsTable.id, jobId));
     } finally {
@@ -355,6 +548,8 @@ async function runGeminiAnalysis(jobId: string, videoBuffer: Buffer, originalNam
     }
   })();
 }
+
+// ── HTTP Routes ───────────────────────────────────────────────────────────────
 
 router.post("/analysis/upload", upload.single("video"), async (req, res) => {
   try {
@@ -365,34 +560,41 @@ router.post("/analysis/upload", upload.single("video"), async (req, res) => {
     }
 
     const sampleInterval = parseFloat(req.body.sampleInterval ?? "2.0");
-    const validInterval = Math.min(10.0, Math.max(0.5, isNaN(sampleInterval) ? 2.0 : sampleInterval));
+    const validInterval  = Math.min(
+      10.0,
+      Math.max(0.5, isNaN(sampleInterval) ? 2.0 : sampleInterval),
+    );
 
     const jobId = randomUUID();
     await db.insert(analysisJobsTable).values({
-      id: jobId,
-      status: "pending",
-      progress: 0,
-      filename: file.originalname,
+      id:             jobId,
+      status:         "pending",
+      progress:       0,
+      filename:       file.originalname,
       sampleInterval: validInterval,
     });
 
-    runGeminiAnalysis(jobId, file.buffer, file.originalname, validInterval);
+    runAnalysisPipeline(jobId, file.buffer, file.originalname, validInterval);
 
-    const [job] = await db.select().from(analysisJobsTable).where(eq(analysisJobsTable.id, jobId));
+    const [job] = await db
+      .select()
+      .from(analysisJobsTable)
+      .where(eq(analysisJobsTable.id, jobId));
+
     if (!job) {
       res.status(500).json({ error: "internal_error", message: "Job creation failed" });
       return;
     }
 
     res.json({
-      id: job.id,
-      status: job.status,
-      progress: job.progress,
-      filename: job.filename,
+      id:             job.id,
+      status:         job.status,
+      progress:       job.progress,
+      filename:       job.filename,
       sampleInterval: job.sampleInterval,
-      createdAt: job.createdAt.toISOString(),
-      completedAt: job.completedAt?.toISOString() ?? null,
-      totalFrames: job.totalFrames ?? null,
+      createdAt:      job.createdAt.toISOString(),
+      completedAt:    job.completedAt?.toISOString() ?? null,
+      totalFrames:    job.totalFrames ?? null,
       processedFrames: job.processedFrames ?? null,
     });
   } catch (err) {
@@ -403,21 +605,25 @@ router.post("/analysis/upload", upload.single("video"), async (req, res) => {
 
 router.get("/analysis/jobs/recent", async (req, res) => {
   try {
-    const jobs = await db.select().from(analysisJobsTable)
+    const jobs = await db
+      .select()
+      .from(analysisJobsTable)
       .orderBy(desc(analysisJobsTable.createdAt))
       .limit(10);
 
-    res.json(jobs.map(job => ({
-      id: job.id,
-      status: job.status,
-      progress: job.progress,
-      filename: job.filename,
-      sampleInterval: job.sampleInterval,
-      createdAt: job.createdAt.toISOString(),
-      completedAt: job.completedAt?.toISOString() ?? null,
-      totalFrames: job.totalFrames ?? null,
-      processedFrames: job.processedFrames ?? null,
-    })));
+    res.json(
+      jobs.map(job => ({
+        id:              job.id,
+        status:          job.status,
+        progress:        job.progress,
+        filename:        job.filename,
+        sampleInterval:  job.sampleInterval,
+        createdAt:       job.createdAt.toISOString(),
+        completedAt:     job.completedAt?.toISOString() ?? null,
+        totalFrames:     job.totalFrames ?? null,
+        processedFrames: job.processedFrames ?? null,
+      })),
+    );
   } catch (err) {
     req.log.error({ err }, "Failed to get recent jobs");
     res.status(500).json({ error: "internal_error", message: "Failed to get recent jobs" });
@@ -428,47 +634,56 @@ router.get("/analysis/:jobId", async (req, res) => {
   try {
     const { jobId } = req.params;
 
-    const [job] = await db.select().from(analysisJobsTable).where(eq(analysisJobsTable.id, jobId));
+    const [job] = await db
+      .select()
+      .from(analysisJobsTable)
+      .where(eq(analysisJobsTable.id, jobId));
+
     if (!job) {
       res.status(404).json({ error: "not_found", message: "Job not found" });
       return;
     }
 
-    const detections = await db.select().from(speciesDetectionsTable).where(
-      eq(speciesDetectionsTable.jobId, jobId)
-    );
+    const detections = await db
+      .select()
+      .from(speciesDetectionsTable)
+      .where(eq(speciesDetectionsTable.jobId, jobId));
 
-    const totalBirds = detections.reduce((sum, d) => sum + d.totalCount, 0);
-    const sortedDetections = [...detections].sort((a, b) => b.totalCount - a.totalCount);
-    const mostCommon = sortedDetections[0]?.species ?? null;
+    const totalBirds   = detections.reduce((s, d) => s + d.totalCount, 0);
+    const sorted       = [...detections].sort((a, b) => b.totalCount - a.totalCount);
+    const mostCommon   = sorted[0]?.species ?? null;
 
     res.json({
       job: {
-        id: job.id,
-        status: job.status,
-        progress: job.progress,
-        filename: job.filename,
-        sampleInterval: job.sampleInterval,
-        createdAt: job.createdAt.toISOString(),
-        completedAt: job.completedAt?.toISOString() ?? null,
-        totalFrames: job.totalFrames ?? null,
+        id:              job.id,
+        status:          job.status,
+        progress:        job.progress,
+        filename:        job.filename,
+        sampleInterval:  job.sampleInterval,
+        createdAt:       job.createdAt.toISOString(),
+        completedAt:     job.completedAt?.toISOString() ?? null,
+        totalFrames:     job.totalFrames ?? null,
         processedFrames: job.processedFrames ?? null,
       },
-      detections: sortedDetections.map(d => ({
-        species: d.species,
-        totalCount: d.totalCount,
+      detections: sorted.map(d => ({
+        species:          d.species,
+        totalCount:       d.totalCount,
         averageConfidence: d.averageConfidence,
-        color: d.color,
-        lastSeenAt: d.lastSeenAt?.toISOString() ?? null,
+        color:            d.color,
+        lastSeenAt:       d.lastSeenAt?.toISOString() ?? null,
       })),
-      summary: job.status === "completed" ? {
-        totalBirdsDetected: totalBirds,
-        uniqueSpecies: detections.length,
-        mostCommonSpecies: mostCommon,
-        processingDurationSeconds: job.completedAt && job.createdAt
-          ? (job.completedAt.getTime() - job.createdAt.getTime()) / 1000
+      summary:
+        job.status === "completed"
+          ? {
+              totalBirdsDetected:      totalBirds,
+              uniqueSpecies:           detections.length,
+              mostCommonSpecies:       mostCommon,
+              processingDurationSeconds:
+                job.completedAt && job.createdAt
+                  ? (job.completedAt.getTime() - job.createdAt.getTime()) / 1000
+                  : null,
+            }
           : null,
-      } : null,
     });
   } catch (err) {
     req.log.error({ err }, "Failed to get analysis status");
@@ -480,19 +695,27 @@ router.get("/analysis/:jobId/frames", async (req, res) => {
   try {
     const { jobId } = req.params;
 
-    const frames = await db.select().from(detectionFramesTable).where(
-      eq(detectionFramesTable.jobId, jobId)
-    );
+    const frames = await db
+      .select()
+      .from(detectionFramesTable)
+      .where(eq(detectionFramesTable.jobId, jobId));
 
-    res.json(frames.map(f => ({
-      frameIndex: f.frameIndex,
-      timestamp: f.timestamp,
-      detections: f.detections,
-    })));
+    res.json(
+      frames.map(f => ({
+        frameIndex: f.frameIndex,
+        timestamp:  f.timestamp,
+        detections: f.detections,
+      })),
+    );
   } catch (err) {
     req.log.error({ err }, "Failed to get frames");
     res.status(500).json({ error: "internal_error", message: "Failed to get frames" });
   }
+});
+
+// Route alias kept for backwards compatibility
+router.get("/analysis/jobs/:jobId", async (req, res) => {
+  res.redirect(`/api/analysis/${req.params.jobId}`);
 });
 
 export default router;
