@@ -2,12 +2,18 @@ import { Router } from "express";
 import { eq, desc, sum, count } from "drizzle-orm";
 import { db } from "@workspace/db";
 import { speciesDetectionsTable, speciesInfoCacheTable, analysisJobsTable } from "@workspace/db";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 
 const router = Router();
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const ai = new GoogleGenAI({
+  apiKey: process.env.AI_INTEGRATIONS_GEMINI_API_KEY || process.env.GEMINI_API_KEY || "",
+  httpOptions: {
+    apiVersion: "",
+    baseUrl: process.env.AI_INTEGRATIONS_GEMINI_BASE_URL,
+  },
+});
+const SPECIES_MODEL = "gemini-2.5-flash";
 
 router.get("/species/stats", async (req, res) => {
   try {
@@ -95,8 +101,11 @@ Return ONLY valid JSON, no markdown, no extra text.`;
     };
 
     try {
-      const result = await model.generateContent(prompt);
-      const text = result.response.text().trim();
+      const result = await ai.models.generateContent({
+        model: SPECIES_MODEL,
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+      });
+      const text = (result.text ?? "").trim();
       const cleanText = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
       const parsed = JSON.parse(cleanText);
 

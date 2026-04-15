@@ -29,7 +29,7 @@ try:
     _api_key = os.environ.get("GEMINI_API_KEY", "")
     if _api_key:
         genai.configure(api_key=_api_key)
-        _gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        _gemini_model = genai.GenerativeModel("gemini-2.0-flash")
         GEMINI_AVAILABLE = True
         print("[species_id] Gemini 1.5 Flash ready for species identification.")
     else:

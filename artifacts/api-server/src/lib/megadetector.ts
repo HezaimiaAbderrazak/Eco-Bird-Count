@@ -20,7 +20,9 @@ import { fileURLToPath } from "url";
 import { dirname } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DETECTOR_SCRIPT = join(__dirname, "../../python/detector.py");
+const DETECTOR_SCRIPT  = join(__dirname, "../../python/detector.py");
+// Use the uv-managed venv that has ultralytics installed.
+const PYTHON_BIN = join(__dirname, "../../../../.pythonlibs/bin/python3");
 
 export interface YoloBirdDetection {
   bbox: [number, number, number, number]; // [x, y, w, h] normalised 0–1
@@ -50,10 +52,10 @@ export async function runMegaDetector(
   if (framePaths.length === 0) return [];
 
   return new Promise((resolve, reject) => {
-    const child = spawn("python3", [DETECTOR_SCRIPT, ...framePaths], {
+    const child = spawn(PYTHON_BIN, [DETECTOR_SCRIPT, ...framePaths], {
       env: {
         ...process.env,
-        YOLO_MODEL_PATH: "/tmp/yolov8n_ecobird.onnx",
+        YOLO_MODEL_PATH: "yolov8n.pt",
       },
     });
 

@@ -25,7 +25,7 @@ import { promisify } from "util";
 import { writeFile, readFile, rm, mkdir } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import { ByteTracker, type RawDetection, type TrackedDetection } from "../lib/bytetrack";
 import { runMegaDetector, buildGuidedPrompt, type YoloBirdDetection } from "../lib/megadetector";
 
@@ -36,13 +36,17 @@ const upload = multer({
 });
 const execFileAsync = promisify(execFile);
 
-// ── AI client ─────────────────────────────────────────────────────────────────
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+// ── AI client — Replit AI Integrations proxy ───────────────────────────────────
+const ai = new GoogleGenAI({
+  apiKey: process.env.AI_INTEGRATIONS_GEMINI_API_KEY || process.env.GEMINI_API_KEY || "",
+  httpOptions: {
+    apiVersion: "",
+    baseUrl: process.env.AI_INTEGRATIONS_GEMINI_BASE_URL,
+  },
+});
 
-// Primary: gemini-1.5-flash (faster, production-grade)
-const detectionModel   = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-// Recovery / reasoning pass
-const reasoningModel   = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const DETECTION_MODEL = "gemini-2.5-flash";
+const RECOVERY_MODEL  = "gemini-2.5-flash";
 
 // ── Species colour map ────────────────────────────────────────────────────────
 const SPECIES_COLORS: Record<string, string> = {
@@ -112,17 +116,18 @@ async function concurrentMap<T, R>(
 }
 
 async function callGeminiWithRetry(
-  model: any,
+  modelName: string,
   parts: any[],
   retries = 4,
   baseDelay = 8000,
 ): Promise<string> {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      const result = await model.generateContent({
+      const result = await ai.models.generateContent({
+        model: modelName,
         contents: [{ role: "user", parts }],
       });
-      return result.response.text().trim();
+      return (result.text ?? "").trim();
     } catch (err: any) {
       const is429 =
         err?.status === 429 ||
@@ -207,7 +212,7 @@ async function recoverLowConfidenceDetection(
       { text: `Current low-confidence label: "${currentLabel}"` },
       { inlineData: { mimeType: "image/jpeg", data: imageBase64 } },
     ];
-    const response = await callGeminiWithRetry(reasoningModel, parts, 2, 3000);
+    const response = await callGeminiWithRetry(RECOVERY_MODEL, parts, 2, 3000);
     const result = response.trim();
 
     if (result === "NO_BIRD") return { species: "", confidence: 0 };
@@ -276,7 +281,7 @@ async function detectBirdsInFrame(
       { inlineData: { mimeType: "image/jpeg", data: imageData.toString("base64") } },
     ];
 
-    const text = await callGeminiWithRetry(detectionModel, parts);
+    const text = await callGeminiWithRetry(DETECTION_MODEL, parts);
     const clean = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
 
     // Find the JSON array, ignoring any leading/trailing text
