@@ -3,13 +3,17 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: EcoBird Counter API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: analysis
+    description: Video analysis operations
+  - name: species
+    description: Species information
 paths:
   /healthz:
     get:
@@ -24,6 +28,148 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /analysis/upload:
+    post:
+      operationId: uploadVideo
+      tags: [analysis]
+      summary: Upload video for analysis
+      description: Upload a video file to begin bird detection analysis
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                video:
+                  type: string
+                  format: binary
+                sampleInterval:
+                  type: number
+                  description: Sample interval in seconds (0.5 to 5.0)
+                  minimum: 0.5
+                  maximum: 5.0
+              required:
+                - video
+      responses:
+        "200":
+          description: Analysis job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnalysisJob"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /analysis/{jobId}:
+    get:
+      operationId: getAnalysisStatus
+      tags: [analysis]
+      summary: Get analysis job status
+      description: Get the current status and results of an analysis job
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Analysis job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnalysisResult"
+        "404":
+          description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /analysis/{jobId}/frames:
+    get:
+      operationId: getAnalysisFrames
+      tags: [analysis]
+      summary: Get detected frames
+      description: Get the list of processed frames with detection data
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of detection frames
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DetectionFrame"
+
+  /analysis/jobs/recent:
+    get:
+      operationId: getRecentJobs
+      tags: [analysis]
+      summary: Get recent analysis jobs
+      description: Get recently submitted analysis jobs
+      responses:
+        "200":
+          description: List of recent jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AnalysisJob"
+
+  /species/{speciesName}/info:
+    get:
+      operationId: getSpeciesInfo
+      tags: [species]
+      summary: Get AI-generated species info card
+      description: Get a detailed AI-generated info card for a species, using Gemini + eBird + Wikipedia
+      parameters:
+        - name: speciesName
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Species information card
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpeciesInfoCard"
+        "404":
+          description: Species not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /species/stats:
+    get:
+      operationId: getSpeciesStats
+      tags: [species]
+      summary: Get overall species statistics
+      description: Get aggregated statistics across all analysis sessions
+      responses:
+        "200":
+          description: Species statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpeciesStats"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +180,214 @@ components:
       required:
         - status
 
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+      required:
+        - error
+        - message
+
+    AnalysisJob:
+      type: object
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        progress:
+          type: number
+          minimum: 0
+          maximum: 100
+        filename:
+          type: string
+        sampleInterval:
+          type: number
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+        totalFrames:
+          type: integer
+          nullable: true
+        processedFrames:
+          type: integer
+          nullable: true
+      required:
+        - id
+        - status
+        - progress
+        - filename
+        - sampleInterval
+        - createdAt
+
+    AnalysisResult:
+      type: object
+      properties:
+        job:
+          $ref: "#/components/schemas/AnalysisJob"
+        detections:
+          type: array
+          items:
+            $ref: "#/components/schemas/SpeciesDetection"
+        summary:
+          $ref: "#/components/schemas/DetectionSummary"
+          nullable: true
+      required:
+        - job
+        - detections
+
+    SpeciesDetection:
+      type: object
+      properties:
+        species:
+          type: string
+        totalCount:
+          type: integer
+        averageConfidence:
+          type: number
+        color:
+          type: string
+        lastSeenAt:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - species
+        - totalCount
+        - averageConfidence
+        - color
+
+    DetectionSummary:
+      type: object
+      properties:
+        totalBirdsDetected:
+          type: integer
+        uniqueSpecies:
+          type: integer
+        mostCommonSpecies:
+          type: string
+          nullable: true
+        processingDurationSeconds:
+          type: number
+          nullable: true
+      required:
+        - totalBirdsDetected
+        - uniqueSpecies
+
+    DetectionFrame:
+      type: object
+      properties:
+        frameIndex:
+          type: integer
+        timestamp:
+          type: number
+        detections:
+          type: array
+          items:
+            $ref: "#/components/schemas/BirdDetection"
+      required:
+        - frameIndex
+        - timestamp
+        - detections
+
+    BirdDetection:
+      type: object
+      properties:
+        trackId:
+          type: integer
+        species:
+          type: string
+        confidence:
+          type: number
+        bbox:
+          type: array
+          items:
+            type: number
+          minItems: 4
+          maxItems: 4
+        color:
+          type: string
+      required:
+        - trackId
+        - species
+        - confidence
+        - bbox
+        - color
+
+    SpeciesInfoCard:
+      type: object
+      properties:
+        speciesName:
+          type: string
+        scientificName:
+          type: string
+        conservationStatus:
+          type: string
+        habitat:
+          type: string
+        diet:
+          type: string
+        funFact:
+          type: string
+        description:
+          type: string
+        ebirdOccurrences:
+          type: string
+          nullable: true
+        source:
+          type: string
+          enum: [ai, cache]
+      required:
+        - speciesName
+        - scientificName
+        - conservationStatus
+        - habitat
+        - diet
+        - funFact
+        - description
+        - source
+
+    SpeciesStats:
+      type: object
+      properties:
+        totalAnalyses:
+          type: integer
+        totalDetections:
+          type: integer
+        topSpecies:
+          type: array
+          items:
+            type: object
+            properties:
+              species:
+                type: string
+              count:
+                type: integer
+            required:
+              - species
+              - count
+        recentActivity:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+              detections:
+                type: integer
+            required:
+              - date
+              - detections
+      required:
+        - totalAnalyses
+        - totalDetections
+        - topSpecies
+        - recentActivity

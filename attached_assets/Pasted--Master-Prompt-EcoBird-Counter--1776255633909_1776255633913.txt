@@ -1,0 +1,34 @@
+إليك "البرومبت الشامل" (Master Prompt) الذي يلخص كامل مشروع EcoBird Counter، وهو مصمم ليعطي الذكاء الاصطناعي (مثل Gemini أو Claude) رؤية كاملة لبرمجة النظام من الصفر أو تطويره بشكل احترافوي.
+​Master Prompt: The EcoBird Counter Full-System Implementation
+​Role: Expert AI Full-Stack Engineer & Computer Vision Specialist.
+Project Goal: Build a real-time AI system for automated bird monitoring and species identification from video files, integrating computer vision with an Agentic AI layer.
+​1. Core Detection & Tracking Logic (Vision Engine)
+​Model: Use YOLOv8-seg for bird detection and instance segmentation (to handle complex backgrounds).
+​Tracking: Implement ByteTrack for persistent identity tracking (Track ID). Each bird must have a unique ID to prevent double-counting across frames.
+​Open-Set Classification: Integrate CLIP (openai/clip-vit-base-patch32) to handle unknown species. 
+​Logic: Compare detected bird crops against known species embeddings. If similarity < 0.65, label as "Unknown 🔍".
+​Temporal Smoothing: Apply logic to stabilize counts across frames, ensuring a bird is only added to the final tally once its Track ID is confirmed.
+​2. The Intelligent Agent Layer (Gemini 1.5 Flash)
+​Engine: Google Gemini 1.5 Flash API for ultra-low latency (< 5 seconds).
+​API Grounding: Integrate the agent with eBird API and Wikipedia API.
+​Functionality: When a user clicks a species in the results table, the agent must: 
+​Fetch real-time occurrence data from eBird.
+​Fetch biological descriptions from Wikipedia.
+​Synthesize a Markdown Info Card containing: Scientific Name, Conservation Status, Habitat, Diet, and a Fun Fact.
+​Regional Context: Specifically optimize for North African/Algerian biodiversity for more accurate "Unknown" identification.
+​3. UI/UX Requirements (Gradio Interface)
+​Theme: "Nature" aesthetic (Green/Earth tones).
+​Input: File uploader for (MP4, AVI, MOV) + Slider for sample_interval (0.5s to 5s).
+​Live View: Video player showing real-time bounding boxes and masks color-coded by species: 
+​🔵 Sparrow, 🟢 Finch, 🔴 Warbler, 🟡 Robin, 🟣 Kingfisher, 🩵 Swallow, 🟠 Eagle, ⚪ Unknown.
+​Results Table: A dynamic dataframe showing: [Species, Total Count, Average Confidence]. Clicking a row triggers the Gemini Agent.
+​4. Technical Constraints & Success Metrics
+​Performance: The system must process frames in real-time.
+​Accuracy: Target F1 Score > 75%.
+​Scalability: The backend should handle multiple doctor/user schedules if integrated into a larger portal (as per PRD history).
+​Error Handling: Implement graceful degradation if APIs (eBird/Wiki) are unreachable.
+​Instruction for the AI: "Based on these requirements, generate the complete Python code for ecobird_app.py, ensuring all library imports (ultralytics, opencv, google-generativeai, gradio) are correctly handled and the logic for the Gemini Agent is seamlessly integrated with the video processing loop."
+​كيف تستخدم هذا البرومبت؟
+​في حال أردت بناء الكود: ضعه في محادثة جديدة مع Gemini 1.5 Pro أو Claude 3.5 Sonnet.
+​في حال أردت شرح المشروع لشخص آخر: هذا البرومبت يعمل كـ "خارطة طريق" (Roadmap) تقنية توضح كيف يربط المشروع بين الرؤية الحاسوبية والذكاء الاصطناعي التوليدي.
+​هذا البرومبت يضمن لك أن الذكاء الاصطناعي سيفهم أن مشروعك ليس مجرد "برنامج كشف" بل هو نظام بيئي ذكي يربط قواعد البيانات العلمية بالواقع الافتراضي.
