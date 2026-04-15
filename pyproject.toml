@@ -10,6 +10,7 @@ dependencies = [
     "ultralytics",
     "opencv-python-headless",
     "requests>=2.32.0",
+    "google-generativeai>=0.8.0",
 ]
 
 [[tool.uv.index]]

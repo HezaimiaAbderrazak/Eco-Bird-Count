@@ -59,39 +59,59 @@ Three standalone Python modules for local YOLOv8-based webcam detection:
 | File | Purpose |
 |------|---------|
 | `detection.py` | YOLOv8 model loading + per-frame inference; filters to bird/animal COCO classes |
+| `tracker.py` | IoU-based multi-object tracker — assigns stable IDs to birds across frames |
+| `species_id.py` | Gemini 1.5 Flash species classifier — classifies each unique track once |
 | `utils.py` | Bird counting, bounding-box drawing, HUD overlay, eBird API helpers |
-| `main.py` | CLI entry point — opens webcam/video, runs the detection loop |
+| `main.py` | Webcam / live video entry point |
+| `video_analysis.py` | Full video pipeline: detect → track → identify species → annotate → export |
 | `requirements.txt` | Local pip requirements (use `opencv-python`, not headless, locally) |
 
 ### Local Setup
 
 ```bash
-# 1. Clone / copy the three Python files to your machine
-# 2. Create a virtual environment (recommended)
+# 1. Create a virtual environment (recommended)
 python -m venv .venv && source .venv/bin/activate   # macOS/Linux
 # python -m venv .venv && .venv\Scripts\activate    # Windows
 
-# 3. Install dependencies
+# 2. Install dependencies
 pip install -r requirements.txt
-
-# 4. Run with your webcam
-python main.py
-
-# Run on a video file instead of webcam
-python main.py --source path/to/video.mp4
-
-# Use a more accurate (but slower) model
-python main.py --model yolov8s.pt
-
-# Add live eBird context (requires a free eBird API key)
-python main.py --ebird-key YOUR_KEY --lat 36.73 --lon 3.08
 ```
 
-### Runtime Controls
+### Video Analysis (recommended — full pipeline)
 
-| Key | Action |
-|-----|--------|
-| Q / ESC | Quit and show session summary |
+```bash
+# Basic — detect and count birds, no species ID
+python video_analysis.py --input birds.mp4
+
+# With Gemini species identification (set GEMINI_API_KEY first)
+export GEMINI_API_KEY=your_key_here
+python video_analysis.py --input birds.mp4
+
+# Fine-tune detection interval (0.5s = more detections, slower)
+python video_analysis.py --input birds.mp4 --interval 0.5
+
+# More accurate model
+python video_analysis.py --input birds.mp4 --model yolov8s.pt
+
+# Live preview window while processing
+python video_analysis.py --input birds.mp4 --preview
+
+# Save JSON results
+python video_analysis.py --input birds.mp4 --json results.json
+
+# Custom output path
+python video_analysis.py --input birds.mp4 --output annotated_output.mp4
+```
+
+Output: `birds_annotated.mp4` with coloured bounding boxes, per-track species labels, and a live species-count panel.
+
+### Webcam (real-time)
+
+```bash
+python main.py                          # default webcam
+python main.py --model yolov8s.pt      # more accurate
+python main.py --ebird-key YOUR_KEY --lat 36.73 --lon 3.08  # + eBird
+```
 
 ### YOLOv8 Model Variants
 
@@ -103,6 +123,12 @@ python main.py --ebird-key YOUR_KEY --lat 36.73 --lon 3.08
 | `yolov8l.pt` | 87 MB | Slower | Very good |
 
 Models auto-download on first run via the Ultralytics CDN.
+
+### Species Identification (Gemini)
+
+Set `GEMINI_API_KEY` to enable species ID. Each unique bird track is classified
+once using its highest-confidence crop. Results are cached — no duplicate API calls.
+Without the key, all birds are labelled "Bird" but counting still works fully.
 
 ## Key Commands
 
