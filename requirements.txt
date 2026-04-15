@@ -1,0 +1,12 @@
+# Eco-Bird-Count – local installation requirements
+# Run:  pip install -r requirements.txt
+#
+# NOTE: opencv-python (not headless) is required locally so the
+#       webcam window works. The Replit environment uses the headless
+#       build; your local machine needs the full build below.
+
+ultralytics>=8.3.0
+opencv-python>=4.10.0
+requests>=2.32.0
+numpy>=1.24.0
+Pillow>=10.0.0

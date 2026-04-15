@@ -52,6 +52,58 @@ EcoBird Counter is a production-grade AI bird monitoring web application. Users 
 - `detection_frames` — Per-frame detection data (bounding boxes, track IDs)
 - `species_info_cache` — Cached AI-generated species info cards
 
+## Real-Time Webcam Detection (Python — run locally)
+
+Three standalone Python modules for local YOLOv8-based webcam detection:
+
+| File | Purpose |
+|------|---------|
+| `detection.py` | YOLOv8 model loading + per-frame inference; filters to bird/animal COCO classes |
+| `utils.py` | Bird counting, bounding-box drawing, HUD overlay, eBird API helpers |
+| `main.py` | CLI entry point — opens webcam/video, runs the detection loop |
+| `requirements.txt` | Local pip requirements (use `opencv-python`, not headless, locally) |
+
+### Local Setup
+
+```bash
+# 1. Clone / copy the three Python files to your machine
+# 2. Create a virtual environment (recommended)
+python -m venv .venv && source .venv/bin/activate   # macOS/Linux
+# python -m venv .venv && .venv\Scripts\activate    # Windows
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Run with your webcam
+python main.py
+
+# Run on a video file instead of webcam
+python main.py --source path/to/video.mp4
+
+# Use a more accurate (but slower) model
+python main.py --model yolov8s.pt
+
+# Add live eBird context (requires a free eBird API key)
+python main.py --ebird-key YOUR_KEY --lat 36.73 --lon 3.08
+```
+
+### Runtime Controls
+
+| Key | Action |
+|-----|--------|
+| Q / ESC | Quit and show session summary |
+
+### YOLOv8 Model Variants
+
+| Model | Size | Speed | Accuracy |
+|-------|------|-------|---------|
+| `yolov8n.pt` (default) | 6 MB | Fastest | Good |
+| `yolov8s.pt` | 22 MB | Fast | Better |
+| `yolov8m.pt` | 52 MB | Medium | Great |
+| `yolov8l.pt` | 87 MB | Slower | Very good |
+
+Models auto-download on first run via the Ultralytics CDN.
+
 ## Key Commands
 
 - `pnpm run typecheck` — full typecheck across all packages
