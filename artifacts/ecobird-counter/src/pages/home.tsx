@@ -1,5 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { UploadCloud, PlaySquare, Bird, AlertCircle, Info, Play, Pause, RotateCcw } from "lucide-react";
+import {
+  UploadCloud, PlaySquare, Bird, AlertCircle, Info,
+  Play, Pause, RotateCcw, ChevronRight, Loader2,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Slider } from "@/components/ui/slider";
@@ -20,6 +23,8 @@ import {
 import { getSpeciesColor } from "@/lib/colors";
 import { cn } from "@/lib/utils";
 
+// ── Types ─────────────────────────────────────────────────────────────────────
+
 interface BirdDetection {
   trackId: number;
   species: string;
@@ -34,6 +39,96 @@ interface DetectionFrame {
   detections: BirdDetection[];
 }
 
+// ── Simple video preview (no bounding boxes) ──────────────────────────────────
+
+function VideoPreview({
+  file,
+  autoPlay,
+  onReady,
+}: {
+  file: File;
+  autoPlay: boolean;
+  onReady?: (el: HTMLVideoElement) => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const objectUrl = useRef("");
+
+  useEffect(() => {
+    objectUrl.current = URL.createObjectURL(file);
+    return () => URL.revokeObjectURL(objectUrl.current);
+  }, [file]);
+
+  useEffect(() => {
+    if (autoPlay && videoRef.current) {
+      videoRef.current.play().catch(() => {});
+      setIsPlaying(true);
+    }
+  }, [autoPlay]);
+
+  const fmt = (s: number) =>
+    `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+  const toggle = () => {
+    if (!videoRef.current) return;
+    if (videoRef.current.paused) {
+      videoRef.current.play();
+      setIsPlaying(true);
+    } else {
+      videoRef.current.pause();
+      setIsPlaying(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div
+        className="relative rounded-xl overflow-hidden bg-black shadow-lg border border-border"
+        style={{ aspectRatio: "16/9" }}
+      >
+        <video
+          ref={videoRef}
+          src={objectUrl.current}
+          className="w-full h-full object-contain"
+          onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
+          onLoadedMetadata={() => {
+            const v = videoRef.current;
+            if (v) { setDuration(v.duration); onReady?.(v); }
+          }}
+          onEnded={() => setIsPlaying(false)}
+          playsInline
+        />
+        <div className="absolute bottom-3 right-3 bg-black/60 text-white text-xs font-mono px-2 py-1 rounded">
+          {fmt(currentTime)} / {fmt(duration || 0)}
+        </div>
+      </div>
+      <div className="flex items-center gap-3">
+        <Button size="sm" variant="outline" onClick={toggle} className="gap-1.5 shrink-0">
+          {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+          {isPlaying ? "Pause" : "Play"}
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => {
+          if (videoRef.current) { videoRef.current.currentTime = 0; videoRef.current.play(); setIsPlaying(true); }
+        }} className="shrink-0 px-2">
+          <RotateCcw className="h-4 w-4" />
+        </Button>
+        <Slider
+          value={[currentTime]}
+          onValueChange={([v]) => { if (videoRef.current) { videoRef.current.currentTime = v; setCurrentTime(v); } }}
+          min={0}
+          max={duration || 100}
+          step={0.1}
+          className="flex-1"
+        />
+      </div>
+    </div>
+  );
+}
+
+// ── Full player with bounding-box overlay ─────────────────────────────────────
+
 function VideoPlayer({
   file,
   frames,
@@ -47,9 +142,7 @@ function VideoPlayer({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const videoUrl = useRef<string>("");
-  const animFrameRef = useRef<number>(0);
+  const objectUrl = useRef("");
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -57,8 +150,8 @@ function VideoPlayer({
   const [currentDetections, setCurrentDetections] = useState<BirdDetection[]>([]);
 
   useEffect(() => {
-    videoUrl.current = URL.createObjectURL(file);
-    return () => URL.revokeObjectURL(videoUrl.current);
+    objectUrl.current = URL.createObjectURL(file);
+    return () => URL.revokeObjectURL(objectUrl.current);
   }, [file]);
 
   const getCurrentFrame = useCallback(
@@ -68,21 +161,17 @@ function VideoPlayer({
       let minDiff = Infinity;
       for (const f of frames) {
         const diff = Math.abs(f.timestamp - time);
-        if (diff < minDiff) {
-          minDiff = diff;
-          best = f;
-        }
+        if (diff < minDiff) { minDiff = diff; best = f; }
       }
       return best;
     },
-    [frames]
+    [frames],
   );
 
   const drawFrame = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
-
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
@@ -93,26 +182,25 @@ function VideoPlayer({
     const rect = video.getBoundingClientRect();
     canvas.width = rect.width;
     canvas.height = rect.height;
-
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const t = video.currentTime;
     const frame = getCurrentFrame(t);
-    if (!frame || !frame.detections.length) return;
+    if (!frame || !frame.detections.length) { setCurrentDetections([]); return; }
 
     setCurrentDetections(frame.detections);
 
-    // Update live counters for all frames up to current time
-    const seenTrackIds = new Set<string>();
+    // Live unique-track counters up to current time
+    const seenKeys = new Set<string>();
     const counters: Record<string, { count: number; color: string }> = {};
     for (const f of frames) {
       if (f.timestamp > t + 0.5) break;
       for (const d of f.detections) {
         const key = `${d.species}-${d.trackId}`;
-        if (!seenTrackIds.has(key)) {
-          seenTrackIds.add(key);
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key);
           if (!counters[d.species]) counters[d.species] = { count: 0, color: d.color };
-          counters[d.species].count++;
+          counters[d.species]!.count++;
         }
       }
     }
@@ -126,34 +214,26 @@ function VideoPlayer({
       const ph = h * canvas.height;
       const color = det.color || getSpeciesColor(det.species);
 
-      // Glow effect
       ctx.shadowColor = color;
-      ctx.shadowBlur = 12;
+      ctx.shadowBlur = 14;
       ctx.strokeStyle = color;
       ctx.lineWidth = 2.5;
       ctx.strokeRect(px, py, pw, ph);
       ctx.shadowBlur = 0;
 
-      // Corner marks
       const cLen = Math.min(pw, ph) * 0.25;
-      ctx.strokeStyle = "#ffffff";
+      ctx.strokeStyle = "#fff";
       ctx.lineWidth = 1.5;
-      // TL
       ctx.beginPath(); ctx.moveTo(px, py + cLen); ctx.lineTo(px, py); ctx.lineTo(px + cLen, py); ctx.stroke();
-      // TR
       ctx.beginPath(); ctx.moveTo(px + pw - cLen, py); ctx.lineTo(px + pw, py); ctx.lineTo(px + pw, py + cLen); ctx.stroke();
-      // BL
       ctx.beginPath(); ctx.moveTo(px, py + ph - cLen); ctx.lineTo(px, py + ph); ctx.lineTo(px + cLen, py + ph); ctx.stroke();
-      // BR
       ctx.beginPath(); ctx.moveTo(px + pw - cLen, py + ph); ctx.lineTo(px + pw, py + ph); ctx.lineTo(px + pw, py + ph - cLen); ctx.stroke();
 
-      // Label
-      const label = `${det.species} ${Math.round(det.confidence * 100)}%`;
+      const label = `#${det.trackId} ${det.species} ${Math.round(det.confidence * 100)}%`;
       const fontSize = Math.max(11, Math.min(14, canvas.width / 45));
       ctx.font = `bold ${fontSize}px 'Plus Jakarta Sans', sans-serif`;
       const tw = ctx.measureText(label).width;
       const th = fontSize + 6;
-
       const lx = px;
       const ly = py > th + 4 ? py - th - 4 : py + ph + 4;
 
@@ -174,87 +254,40 @@ function VideoPlayer({
       ctx.fill();
       ctx.globalAlpha = 1;
 
-      ctx.fillStyle = "#ffffff";
+      ctx.fillStyle = "#fff";
       ctx.fillText(label, lx + 5, ly + th - 5);
-
-      // Track ID dot
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(px + pw - 6, py + 6, 4, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = "#ffffff";
-      ctx.font = `bold ${Math.max(8, fontSize - 3)}px monospace`;
-      ctx.textAlign = "center";
-      ctx.fillText(`${det.trackId}`, px + pw - 6, py + 10);
-      ctx.textAlign = "left";
     }
   }, [frames, getCurrentFrame]);
 
   useEffect(() => {
     let raf: number;
-    const loop = () => {
-      drawFrame();
-      raf = requestAnimationFrame(loop);
-    };
+    const loop = () => { drawFrame(); raf = requestAnimationFrame(loop); };
     raf = requestAnimationFrame(loop);
-    animFrameRef.current = raf;
     return () => cancelAnimationFrame(raf);
   }, [drawFrame]);
 
-  const handleTimeUpdate = () => {
-    if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
-  };
-
-  const handleLoadedMetadata = () => {
-    if (videoRef.current) setDuration(videoRef.current.duration);
-  };
-
-  const togglePlay = () => {
+  const toggle = () => {
     if (!videoRef.current) return;
-    if (videoRef.current.paused) {
-      videoRef.current.play();
-      setIsPlaying(true);
-    } else {
-      videoRef.current.pause();
-      setIsPlaying(false);
-    }
+    if (videoRef.current.paused) { videoRef.current.play(); setIsPlaying(true); }
+    else { videoRef.current.pause(); setIsPlaying(false); }
   };
-
-  const handleSeek = (val: number[]) => {
-    if (videoRef.current) {
-      videoRef.current.currentTime = val[0];
-      setCurrentTime(val[0]);
-    }
-  };
-
-  const handleRestart = () => {
-    if (videoRef.current) {
-      videoRef.current.currentTime = 0;
-      videoRef.current.play();
-      setIsPlaying(true);
-    }
-  };
-
-  const handleEnded = () => setIsPlaying(false);
 
   const fmt = (s: number) =>
     `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 
   return (
-    <div className="space-y-4">
-      {/* Video + Canvas overlay */}
+    <div className="space-y-3">
       <div
-        ref={containerRef}
         className="relative rounded-xl overflow-hidden bg-black shadow-lg border border-border"
         style={{ aspectRatio: "16/9" }}
       >
         <video
           ref={videoRef}
-          src={videoUrl.current}
+          src={objectUrl.current}
           className="w-full h-full object-contain"
-          onTimeUpdate={handleTimeUpdate}
-          onLoadedMetadata={handleLoadedMetadata}
-          onEnded={handleEnded}
+          onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
+          onLoadedMetadata={() => { if (videoRef.current) setDuration(videoRef.current.duration); }}
+          onEnded={() => setIsPlaying(false)}
           playsInline
         />
         <canvas
@@ -263,7 +296,7 @@ function VideoPlayer({
           style={{ zIndex: 10 }}
         />
 
-        {/* Live detection badge overlay */}
+        {/* Live species badge overlay */}
         {currentDetections.length > 0 && (
           <div className="absolute top-3 left-3 flex flex-wrap gap-1.5 z-20 max-w-[60%]">
             {currentDetections.map((d, i) => (
@@ -280,7 +313,13 @@ function VideoPlayer({
           </div>
         )}
 
-        {/* Frame timestamp */}
+        <div className="absolute top-3 right-3 z-20">
+          <Badge className="bg-green-600 text-white text-xs">
+            <span className="w-1.5 h-1.5 rounded-full bg-white mr-1.5 animate-pulse inline-block" />
+            Live tracking
+          </Badge>
+        </div>
+
         <div className="absolute bottom-3 right-3 z-20 bg-black/60 text-white text-xs font-mono px-2 py-1 rounded">
           {fmt(currentTime)} / {fmt(duration || 0)}
         </div>
@@ -288,16 +327,18 @@ function VideoPlayer({
 
       {/* Controls */}
       <div className="flex items-center gap-3">
-        <Button size="sm" variant="outline" onClick={togglePlay} className="gap-1.5 shrink-0">
+        <Button size="sm" variant="outline" onClick={toggle} className="gap-1.5 shrink-0">
           {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
           {isPlaying ? "Pause" : "Play"}
         </Button>
-        <Button size="sm" variant="ghost" onClick={handleRestart} className="shrink-0 px-2">
+        <Button size="sm" variant="ghost" onClick={() => {
+          if (videoRef.current) { videoRef.current.currentTime = 0; videoRef.current.play(); setIsPlaying(true); }
+        }} className="shrink-0 px-2">
           <RotateCcw className="h-4 w-4" />
         </Button>
         <Slider
           value={[currentTime]}
-          onValueChange={handleSeek}
+          onValueChange={([v]) => { if (videoRef.current) { videoRef.current.currentTime = v; setCurrentTime(v); } }}
           min={0}
           max={duration || 100}
           step={0.1}
@@ -305,9 +346,9 @@ function VideoPlayer({
         />
       </div>
 
-      {/* Live Species Counters */}
+      {/* Live unique-bird counters */}
       {Object.keys(liveCounters).length > 0 && (
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2 mt-1">
           {Object.entries(liveCounters)
             .sort((a, b) => b[1].count - a[1].count)
             .map(([species, data]) => (
@@ -318,7 +359,7 @@ function VideoPlayer({
                   "flex items-center gap-2 p-2.5 rounded-lg border transition-all text-left hover:shadow-sm",
                   selectedSpecies === species
                     ? "border-primary bg-primary/5 shadow-sm"
-                    : "border-border bg-card hover:border-primary/40"
+                    : "border-border bg-card hover:border-primary/40",
                 )}
               >
                 <div
@@ -336,11 +377,14 @@ function VideoPlayer({
   );
 }
 
+// ── Home page ─────────────────────────────────────────────────────────────────
+
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [sampleInterval, setSampleInterval] = useState([1.5]);
   const [jobId, setJobId] = useState<string | null>(null);
   const [selectedSpecies, setSelectedSpecies] = useState<string | null>(null);
+  const [autoPlay, setAutoPlay] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const uploadMutation = useUploadVideo();
@@ -358,7 +402,9 @@ export default function Home() {
   });
 
   const isCompleted = analysisStatus?.job?.status === "completed";
-  const isAnalyzing = analysisStatus?.job?.status === "pending" || analysisStatus?.job?.status === "processing";
+  const isAnalyzing =
+    analysisStatus?.job?.status === "pending" ||
+    analysisStatus?.job?.status === "processing";
   const isFailed = analysisStatus?.job?.status === "failed";
 
   const { data: rawFrames } = useGetAnalysisFrames(jobId || "", {
@@ -367,58 +413,71 @@ export default function Home() {
       queryKey: getGetAnalysisFramesQueryKey(jobId || ""),
     },
   });
-
   const frames = (rawFrames as DetectionFrame[] | undefined) ?? [];
 
-  const { data: speciesInfo, isLoading: isSpeciesInfoLoading } = useGetSpeciesInfo(selectedSpecies || "", {
-    query: {
-      enabled: !!selectedSpecies,
-      queryKey: getGetSpeciesInfoQueryKey(selectedSpecies || ""),
+  const { data: speciesInfo, isLoading: isSpeciesInfoLoading } = useGetSpeciesInfo(
+    selectedSpecies || "",
+    {
+      query: {
+        enabled: !!selectedSpecies,
+        queryKey: getGetSpeciesInfoQueryKey(selectedSpecies || ""),
+      },
     },
-  });
+  );
 
   const handleFileDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     const f = e.dataTransfer.files[0];
-    if (f && f.type.startsWith("video/")) setFile(f);
+    if (f && f.type.startsWith("video/")) { setFile(f); setAutoPlay(false); }
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
-    if (f) setFile(f);
+    if (f) { setFile(f); setAutoPlay(false); }
   };
 
-  const handleUpload = async () => {
+  const handleStartAnalysis = async () => {
     if (!file) return;
     try {
-      const res = await uploadMutation.mutateAsync({ data: { video: file, sampleInterval: sampleInterval[0] } as any });
+      setAutoPlay(true); // play video immediately
+      const res = await uploadMutation.mutateAsync({
+        data: { video: file, sampleInterval: sampleInterval[0] } as any,
+      });
       setJobId(res.id);
       setSelectedSpecies(null);
     } catch (err) {
       console.error("Upload failed", err);
+      setAutoPlay(false);
     }
   };
 
-  return (
-    <div className="space-y-6 animate-in fade-in duration-500">
-      <div>
-        <h1 className="text-3xl font-serif font-bold">Video Analysis</h1>
-        <p className="text-muted-foreground mt-1">Upload footage for real-time AI species detection and identification.</p>
-      </div>
+  const resetAll = () => {
+    setFile(null);
+    setJobId(null);
+    setSelectedSpecies(null);
+    setAutoPlay(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
 
-      {/* Upload / Progress */}
-      {!jobId ? (
-        <Card>
+  // ── Layout: no file selected ────────────────────────────────────────────────
+  if (!file) {
+    return (
+      <div className="space-y-6 animate-in fade-in duration-500">
+        <div>
+          <h1 className="text-3xl font-serif font-bold">Video Analysis</h1>
+          <p className="text-muted-foreground mt-1">
+            Upload bird footage for AI species detection and tracking.
+          </p>
+        </div>
+
+        <Card className="max-w-2xl mx-auto">
           <CardHeader>
             <CardTitle>New Analysis</CardTitle>
             <CardDescription>Drag and drop a video file (MP4, AVI, MOV) to begin.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
             <div
-              className={cn(
-                "border-2 border-dashed rounded-xl p-10 flex flex-col items-center justify-center text-center cursor-pointer transition-colors",
-                file ? "border-primary bg-primary/5" : "border-border hover:border-primary/50 hover:bg-muted/50"
-              )}
+              className="border-2 border-dashed rounded-xl p-14 flex flex-col items-center justify-center text-center cursor-pointer transition-colors border-border hover:border-primary/50 hover:bg-muted/50"
               onDragOver={(e) => e.preventDefault()}
               onDrop={handleFileDrop}
               onClick={() => fileInputRef.current?.click()}
@@ -430,74 +489,302 @@ export default function Home() {
                 accept="video/mp4,video/avi,video/quicktime"
                 onChange={handleFileSelect}
               />
-              {file ? (
-                <>
-                  <div className="h-12 w-12 rounded-full bg-primary/20 flex items-center justify-center text-primary mb-4">
-                    <PlaySquare className="h-6 w-6" />
+              <div className="h-14 w-14 rounded-full bg-muted flex items-center justify-center text-muted-foreground mb-4">
+                <UploadCloud className="h-7 w-7" />
+              </div>
+              <h3 className="text-lg font-medium">Click or drag a video here</h3>
+              <p className="text-sm text-muted-foreground mt-1">MP4 · AVI · MOV — max 500 MB</p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  // ── Layout: file selected (all phases with file present) ────────────────────
+  return (
+    <div className="space-y-6 animate-in fade-in duration-500">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <h1 className="text-3xl font-serif font-bold">Video Analysis</h1>
+          <p className="text-muted-foreground mt-1">
+            Upload bird footage for AI species detection and tracking.
+          </p>
+        </div>
+        {!isAnalyzing && (
+          <Button variant="outline" size="sm" onClick={resetAll} className="gap-1.5">
+            <UploadCloud className="h-4 w-4" /> Analyse another video
+          </Button>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        {/* ── LEFT PANEL ─────────────────────────────────────────────────── */}
+        <div className="lg:col-span-1 space-y-4">
+
+          {/* File info + controls (only before job starts) */}
+          {!jobId && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2">
+                  <PlaySquare className="h-4 w-4 text-primary" /> Selected File
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                <div className="bg-muted/40 rounded-lg p-3 flex items-center gap-3">
+                  <div className="h-9 w-9 rounded-lg bg-primary/10 flex items-center justify-center text-primary shrink-0">
+                    <PlaySquare className="h-5 w-5" />
                   </div>
-                  <h3 className="text-lg font-medium">{file.name}</h3>
-                  <p className="text-sm text-muted-foreground mt-1">{(file.size / (1024 * 1024)).toFixed(2)} MB</p>
-                </>
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium truncate">{file.name}</p>
+                    <p className="text-xs text-muted-foreground">{(file.size / (1024 * 1024)).toFixed(2)} MB</p>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-medium">Sample Interval</label>
+                    <span className="text-sm font-mono text-muted-foreground">{sampleInterval[0]}s</span>
+                  </div>
+                  <Slider
+                    value={sampleInterval}
+                    onValueChange={setSampleInterval}
+                    min={0.5}
+                    max={5}
+                    step={0.5}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    How often frames are sampled. Lower = more frames analysed.
+                  </p>
+                </div>
+
+                <Button
+                  className="w-full gap-2"
+                  size="lg"
+                  disabled={uploadMutation.isPending}
+                  onClick={handleStartAnalysis}
+                >
+                  {uploadMutation.isPending ? (
+                    <><Loader2 className="h-4 w-4 animate-spin" /> Uploading…</>
+                  ) : (
+                    <><Play className="h-4 w-4" /> Start Analysis</>
+                  )}
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Progress card during analysis */}
+          {isAnalyzing && (
+            <Card>
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between">
+                  <CardTitle className="text-base">Analysing…</CardTitle>
+                  <Badge variant="secondary" className="animate-pulse capitalize">
+                    {analysisStatus?.job?.status}
+                  </Badge>
+                </div>
+                <CardDescription className="text-xs mt-0.5">
+                  {analysisStatus?.job?.filename || file.name}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">
+                      {analysisStatus?.job?.status === "processing"
+                        ? `Frame ${analysisStatus.job.processedFrames ?? 0} / ${analysisStatus.job.totalFrames ?? "…"}`
+                        : "Queued…"}
+                    </span>
+                    <span className="font-mono font-medium">
+                      {Math.round(analysisStatus?.job?.progress ?? 0)}%
+                    </span>
+                  </div>
+                  <Progress value={analysisStatus?.job?.progress ?? 0} className="h-2" />
+                </div>
+                <div className="space-y-2 text-xs text-muted-foreground">
+                  {[
+                    { done: (analysisStatus?.job?.progress ?? 0) >= 15, label: "Frame extraction" },
+                    { done: (analysisStatus?.job?.progress ?? 0) >= 80, label: "Gemini 1.5 Flash detection" },
+                    { done: (analysisStatus?.job?.progress ?? 0) >= 90, label: "ByteTracker ID assignment" },
+                    { done: (analysisStatus?.job?.progress ?? 0) >= 100, label: "Species validation" },
+                  ].map(({ done, label }) => (
+                    <div key={label} className="flex items-center gap-2">
+                      <div className={cn(
+                        "h-2 w-2 rounded-full shrink-0",
+                        done ? "bg-green-500" : "bg-muted-foreground/30"
+                      )} />
+                      <span className={done ? "text-foreground" : ""}>{label}</span>
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Summary stats after completion */}
+          {isCompleted && (
+            <div className="space-y-3">
+              {[
+                { label: "Unique Birds", value: analysisStatus?.summary?.totalBirdsDetected ?? 0 },
+                { label: "Species Detected", value: analysisStatus?.summary?.uniqueSpecies ?? 0 },
+                { label: "Frames Analysed", value: analysisStatus?.job?.totalFrames ?? 0 },
+                {
+                  label: "Processing Time",
+                  value: `${Math.round(analysisStatus?.summary?.processingDurationSeconds ?? 0)}s`,
+                },
+              ].map((stat) => (
+                <div
+                  key={stat.label}
+                  className="flex items-center justify-between px-4 py-3 rounded-lg bg-muted/30 border border-border/50"
+                >
+                  <span className="text-sm text-muted-foreground">{stat.label}</span>
+                  <span className="text-lg font-bold font-mono">{stat.value}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Species info panel (right-panel on desktop becomes bottom on mobile) */}
+          {isCompleted && (
+            <div>
+              {selectedSpecies ? (
+                <Card className="border-primary/20 shadow-md overflow-hidden animate-in fade-in slide-in-from-bottom-4">
+                  {isSpeciesInfoLoading ? (
+                    <div className="p-5 space-y-4">
+                      <Skeleton className="h-7 w-3/4" />
+                      <Skeleton className="h-4 w-1/2" />
+                      <Skeleton className="h-20 w-full" />
+                      <p className="text-xs text-center text-muted-foreground animate-pulse">
+                        Generating AI field guide…
+                      </p>
+                    </div>
+                  ) : speciesInfo ? (
+                    <>
+                      <CardHeader className="bg-primary/5 border-b pb-4">
+                        <div className="flex items-center justify-between mb-1">
+                          <Badge variant="outline" className="bg-background text-xs">
+                            {speciesInfo.conservationStatus}
+                          </Badge>
+                          <Badge variant="secondary" className="text-xs">
+                            {speciesInfo.source === "ai" ? "AI Generated" : "Cached"}
+                          </Badge>
+                        </div>
+                        <div className="flex items-center gap-2 mt-1">
+                          <div
+                            className="w-3 h-3 rounded-full shrink-0"
+                            style={{ backgroundColor: getSpeciesColor(speciesInfo.speciesName) }}
+                          />
+                          <CardTitle className="text-xl font-serif">{speciesInfo.speciesName}</CardTitle>
+                        </div>
+                        <CardDescription className="italic text-sm mt-0.5">
+                          {speciesInfo.scientificName}
+                        </CardDescription>
+                      </CardHeader>
+                      <div className="p-5 space-y-4 overflow-y-auto max-h-[55vh]">
+                        <div>
+                          <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5 flex items-center gap-1">
+                            <Info className="h-3.5 w-3.5" /> Description
+                          </h4>
+                          <p className="text-sm leading-relaxed">{speciesInfo.description}</p>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="bg-muted/50 p-3 rounded-lg border border-border/50">
+                            <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1">
+                              Habitat
+                            </h4>
+                            <p className="text-xs leading-relaxed">{speciesInfo.habitat}</p>
+                          </div>
+                          <div className="bg-muted/50 p-3 rounded-lg border border-border/50">
+                            <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1">
+                              Diet
+                            </h4>
+                            <p className="text-xs leading-relaxed">{speciesInfo.diet}</p>
+                          </div>
+                        </div>
+                        {speciesInfo.ebirdOccurrences && (
+                          <div className="bg-accent/10 p-3 rounded-lg border border-accent/20">
+                            <h4 className="text-xs font-semibold uppercase tracking-wider mb-1 text-accent-foreground/70">
+                              eBird — North Africa
+                            </h4>
+                            <p className="text-xs text-accent-foreground">{speciesInfo.ebirdOccurrences}</p>
+                          </div>
+                        )}
+                        <div className="bg-secondary/10 p-4 rounded-lg border border-secondary/20 relative overflow-hidden">
+                          <div className="absolute top-0 left-0 w-1 h-full bg-secondary" />
+                          <h4 className="text-xs font-semibold text-secondary-foreground mb-1">Fun Fact</h4>
+                          <p className="text-xs text-secondary-foreground/90 italic leading-relaxed">
+                            {speciesInfo.funFact}
+                          </p>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="p-6 text-center text-muted-foreground text-sm">
+                      Could not load species info.
+                    </div>
+                  )}
+                </Card>
               ) : (
-                <>
-                  <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center text-muted-foreground mb-4">
-                    <UploadCloud className="h-6 w-6" />
-                  </div>
-                  <h3 className="text-lg font-medium">Click or drag video here</h3>
-                  <p className="text-sm text-muted-foreground mt-1">Maximum file size 500 MB</p>
-                </>
+                <Card className="h-40 flex flex-col items-center justify-center text-center p-6 border-dashed border-2 bg-muted/20">
+                  <Bird className="h-8 w-8 text-muted mb-2" strokeWidth={1} />
+                  <p className="text-sm text-muted-foreground">
+                    Click a species badge or table row to open the AI field guide
+                  </p>
+                </Card>
               )}
             </div>
+          )}
+        </div>
 
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <label className="text-sm font-medium">Sample Interval</label>
-                <span className="text-sm text-muted-foreground">{sampleInterval[0]}s</span>
-              </div>
-              <Slider value={sampleInterval} onValueChange={setSampleInterval} min={0.5} max={5} step={0.5} />
-              <p className="text-xs text-muted-foreground">
-                How frequently to sample frames for analysis. Lower = more precision.
-              </p>
-            </div>
+        {/* ── RIGHT PANEL (video + results table) ───────────────────────── */}
+        <div className="lg:col-span-2 space-y-6">
 
-            <Button className="w-full" size="lg" disabled={!file || uploadMutation.isPending} onClick={handleUpload}>
-              {uploadMutation.isPending ? "Uploading..." : "Start Analysis"}
-            </Button>
-          </CardContent>
-        </Card>
-      ) : isAnalyzing ? (
-        <Card>
-          <CardContent className="py-8 space-y-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="font-medium">{analysisStatus?.job?.filename || file?.name}</h3>
-                <p className="text-sm text-muted-foreground mt-0.5">
-                  {analysisStatus?.job?.status === "processing" ? `Processing frame ${analysisStatus.job.processedFrames || 0} of ${analysisStatus.job.totalFrames || "..."}` : "Queued for processing..."}
-                </p>
-              </div>
-              <Badge variant="secondary" className="capitalize animate-pulse">
-                {analysisStatus?.job?.status}
-              </Badge>
-            </div>
-            <div className="space-y-2">
-              <div className="flex justify-between text-sm">
-                <span className="text-muted-foreground">Progress</span>
-                <span className="font-mono font-medium">{Math.round(analysisStatus?.job?.progress || 0)}%</span>
-              </div>
-              <Progress value={analysisStatus?.job?.progress || 0} className="h-2" />
-            </div>
-            <p className="text-xs text-muted-foreground text-center">
-              The system is simulating YOLOv8 frame sampling + ByteTrack identity tracking...
-            </p>
-          </CardContent>
-        </Card>
-      ) : null}
+          {/* Video preview — before analysis starts */}
+          {!jobId && (
+            <Card>
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <CardTitle className="text-base">Video Preview</CardTitle>
+                    <CardDescription className="text-xs mt-0.5">
+                      Press Start Analysis to begin AI bird detection
+                    </CardDescription>
+                  </div>
+                  <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                </div>
+              </CardHeader>
+              <CardContent>
+                <VideoPreview file={file} autoPlay={false} />
+              </CardContent>
+            </Card>
+          )}
 
-      {/* Main content: video player + info panel */}
-      {isCompleted && file && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left: video player + stats table */}
-          <div className="lg:col-span-2 space-y-6 animate-in fade-in slide-in-from-bottom-4">
+          {/* Video preview — while analysis runs (auto-plays) */}
+          {isAnalyzing && (
+            <Card>
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <CardTitle className="text-base">Video Playback</CardTitle>
+                    <CardDescription className="text-xs mt-0.5">
+                      Bounding boxes will appear once analysis completes
+                    </CardDescription>
+                  </div>
+                  <Badge variant="secondary" className="text-xs animate-pulse">
+                    <Loader2 className="h-3 w-3 mr-1 animate-spin" /> Analysing
+                  </Badge>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <VideoPreview file={file} autoPlay={autoPlay} />
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Full tracking player — after analysis completes */}
+          {isCompleted && (
             <Card>
               <CardHeader className="pb-3">
                 <div className="flex items-center justify-between">
@@ -507,9 +794,9 @@ export default function Home() {
                       Bounding boxes update frame-by-frame as the video plays
                     </CardDescription>
                   </div>
-                  <Badge variant="default" className="bg-green-600">
+                  <Badge className="bg-green-600 text-white">
                     <span className="w-1.5 h-1.5 rounded-full bg-white mr-1.5 animate-pulse inline-block" />
-                    Real-time
+                    Real-time tracking
                   </Badge>
                 </div>
               </CardHeader>
@@ -522,163 +809,88 @@ export default function Home() {
                 />
               </CardContent>
             </Card>
+          )}
 
-            {/* Summary stats */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              {[
-                { label: "Total Birds", value: analysisStatus?.summary?.totalBirdsDetected ?? 0 },
-                { label: "Species", value: analysisStatus?.summary?.uniqueSpecies ?? 0 },
-                { label: "Frames", value: analysisStatus?.job?.totalFrames ?? 0 },
-                { label: "Duration", value: `${Math.round(analysisStatus?.summary?.processingDurationSeconds ?? 0)}s` },
-              ].map((stat) => (
-                <Card key={stat.label}>
-                  <CardContent className="p-4">
-                    <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">{stat.label}</p>
-                    <p className="text-2xl font-bold mt-1">{stat.value}</p>
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
-
-            {/* Species table */}
+          {/* ── Results table ───────────────────────────────────────────── */}
+          {isCompleted && (
             <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Detected Species</CardTitle>
-                <CardDescription>Click a row to view the AI field guide entry.</CardDescription>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-base flex items-center gap-2">
+                  <Bird className="h-4 w-4 text-primary" />
+                  Detection Results
+                </CardTitle>
+                <CardDescription>
+                  Click any row to open the AI field guide for that species.
+                </CardDescription>
               </CardHeader>
               <Table>
                 <TableHeader>
                   <TableRow>
                     <TableHead>Species</TableHead>
-                    <TableHead className="text-right">Count</TableHead>
+                    <TableHead className="text-center">Unique Birds</TableHead>
                     <TableHead className="text-right">Avg Confidence</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {(analysisStatus?.detections ?? []).length === 0 && (
+                  {(analysisStatus?.detections ?? []).length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={3} className="text-center text-muted-foreground py-8">No birds detected.</TableCell>
+                      <TableCell colSpan={3} className="text-center text-muted-foreground py-10">
+                        <Bird className="h-8 w-8 text-muted mx-auto mb-2" strokeWidth={1} />
+                        No birds detected in this footage.
+                      </TableCell>
                     </TableRow>
+                  ) : (
+                    (analysisStatus?.detections ?? []).map((d) => (
+                      <TableRow
+                        key={d.species}
+                        className={cn(
+                          "cursor-pointer hover:bg-muted/50 transition-colors",
+                          selectedSpecies === d.species && "bg-primary/5",
+                        )}
+                        onClick={() => setSelectedSpecies(d.species)}
+                      >
+                        <TableCell>
+                          <div className="flex items-center gap-2.5">
+                            <div
+                              className="w-3 h-3 rounded-full shrink-0"
+                              style={{
+                                backgroundColor: d.color || getSpeciesColor(d.species),
+                              }}
+                            />
+                            <span className="font-medium">{d.species}</span>
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-center">
+                          <Badge variant="secondary" className="font-mono tabular-nums">
+                            {d.totalCount}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <div className="flex items-center justify-end gap-2">
+                            <span className="text-sm text-muted-foreground tabular-nums">
+                              {Math.round(d.averageConfidence * 100)}%
+                            </span>
+                            <Progress value={d.averageConfidence * 100} className="w-16 h-1.5" />
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))
                   )}
-                  {(analysisStatus?.detections ?? []).map((d) => (
-                    <TableRow
-                      key={d.species}
-                      className={cn(
-                        "cursor-pointer hover:bg-muted/50 transition-colors",
-                        selectedSpecies === d.species && "bg-muted/80"
-                      )}
-                      onClick={() => setSelectedSpecies(d.species)}
-                    >
-                      <TableCell className="font-medium">
-                        <div className="flex items-center gap-2.5">
-                          <div className="w-3 h-3 rounded-full" style={{ backgroundColor: d.color || getSpeciesColor(d.species) }} />
-                          {d.species}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right">{d.totalCount}</TableCell>
-                      <TableCell className="text-right">
-                        <div className="flex items-center justify-end gap-2">
-                          <span className="text-sm text-muted-foreground">{Math.round(d.averageConfidence * 100)}%</span>
-                          <Progress value={d.averageConfidence * 100} className="w-16 h-1.5" />
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  ))}
                 </TableBody>
               </Table>
-              <div className="p-3 border-t">
-                <Button variant="ghost" size="sm" className="w-full text-muted-foreground" onClick={() => { setJobId(null); setFile(null); setSelectedSpecies(null); }}>
-                  Analyze another video
-                </Button>
-              </div>
             </Card>
-          </div>
-
-          {/* Right: species info panel */}
-          <div className="lg:col-span-1">
-            {selectedSpecies ? (
-              <Card className="sticky top-6 flex flex-col overflow-hidden animate-in fade-in slide-in-from-right-8 border-primary/20 shadow-md">
-                {isSpeciesInfoLoading ? (
-                  <div className="p-6 space-y-6">
-                    <div className="space-y-3">
-                      <Skeleton className="h-8 w-3/4" />
-                      <Skeleton className="h-4 w-1/2" />
-                    </div>
-                    <div className="space-y-3">
-                      <Skeleton className="h-4 w-full" />
-                      <Skeleton className="h-4 w-full" />
-                      <Skeleton className="h-4 w-4/5" />
-                    </div>
-                    <p className="text-xs text-center text-muted-foreground animate-pulse">Generating AI field guide...</p>
-                  </div>
-                ) : speciesInfo ? (
-                  <>
-                    <CardHeader className="bg-primary/5 border-b pb-4">
-                      <div className="flex items-center justify-between mb-1">
-                        <Badge variant="outline" className="bg-background text-xs">{speciesInfo.conservationStatus}</Badge>
-                        <Badge variant="secondary" className="text-xs">{speciesInfo.source === "ai" ? "AI Generated" : "Cached"}</Badge>
-                      </div>
-                      <div className="flex items-center gap-2 mt-1">
-                        <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: getSpeciesColor(speciesInfo.speciesName) }} />
-                        <CardTitle className="text-xl font-serif">{speciesInfo.speciesName}</CardTitle>
-                      </div>
-                      <CardDescription className="italic text-sm mt-0.5">{speciesInfo.scientificName}</CardDescription>
-                    </CardHeader>
-                    <div className="p-5 space-y-5 overflow-y-auto max-h-[60vh]">
-                      <div>
-                        <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
-                          <Info className="h-3.5 w-3.5" /> Description
-                        </h4>
-                        <p className="text-sm leading-relaxed">{speciesInfo.description}</p>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-3">
-                        <div className="bg-muted/50 p-3 rounded-lg border border-border/50">
-                          <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1">Habitat</h4>
-                          <p className="text-xs leading-relaxed">{speciesInfo.habitat}</p>
-                        </div>
-                        <div className="bg-muted/50 p-3 rounded-lg border border-border/50">
-                          <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1">Diet</h4>
-                          <p className="text-xs leading-relaxed">{speciesInfo.diet}</p>
-                        </div>
-                      </div>
-
-                      {speciesInfo.ebirdOccurrences && (
-                        <div className="bg-accent/10 p-3 rounded-lg border border-accent/20">
-                          <h4 className="text-xs font-semibold uppercase tracking-wider mb-1 text-accent-foreground/70">eBird — North Africa</h4>
-                          <p className="text-xs text-accent-foreground">{speciesInfo.ebirdOccurrences}</p>
-                        </div>
-                      )}
-
-                      <div className="bg-secondary/10 p-4 rounded-lg border border-secondary/20 relative overflow-hidden">
-                        <div className="absolute top-0 left-0 w-1 h-full bg-secondary" />
-                        <h4 className="text-xs font-semibold text-secondary-foreground mb-1">Fun Fact</h4>
-                        <p className="text-xs text-secondary-foreground/90 italic leading-relaxed">{speciesInfo.funFact}</p>
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="p-6 text-center text-muted-foreground text-sm">Could not load species info.</div>
-                )}
-              </Card>
-            ) : (
-              <Card className="sticky top-6 h-64 flex flex-col items-center justify-center text-center p-8 border-dashed border-2 bg-muted/20">
-                <Bird className="h-12 w-12 text-muted mb-3" strokeWidth={1} />
-                <h3 className="font-medium text-muted-foreground">Field Guide</h3>
-                <p className="text-xs text-muted-foreground/70 mt-1.5">
-                  Click a species badge during playback or a row in the table to open the AI field guide.
-                </p>
-              </Card>
-            )}
-          </div>
+          )}
         </div>
-      )}
+      </div>
 
+      {/* Failed state */}
       {isFailed && (
         <Alert variant="destructive">
           <AlertCircle className="h-4 w-4" />
           <AlertTitle>Analysis Failed</AlertTitle>
-          <AlertDescription>There was an error processing the video. Please try again.</AlertDescription>
+          <AlertDescription>
+            There was an error processing this video. Please try again with a different file.
+          </AlertDescription>
         </Alert>
       )}
     </div>
