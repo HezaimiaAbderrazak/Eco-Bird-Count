@@ -68,3 +68,4 @@ externalPort = 3003
 
 [userenv.shared]
 GEMINI_API_KEY = "AIzaSyBcNdzVjr3sagahFbl6GnFBBl0dEw0IzKU"
+EBIRD_API_KEY = "d5c45fh4trq8"
